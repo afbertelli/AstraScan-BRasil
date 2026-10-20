@@ -1,0 +1,6 @@
+{
+  "name": "AstraScan GM Brasil",
+  "description": "Scanner automotivo para GM Astra Brasil (1995-2011) com auto-detecção de protocolo e fingerprinting de ECU.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
