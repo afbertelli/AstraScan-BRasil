@@ -18,8 +18,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ListAlt
 import androidx.compose.material.icons.filled.DirectionsCar
-import androidx.compose.material.icons.filled.ListAlt
 import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.WarningAmber
@@ -38,12 +38,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.material.icons.filled.Build
 import com.example.ui.autoresize.AutoResizeProvider
 import com.example.ui.screens.ConnectionScreen
 import com.example.ui.screens.DashboardScreen
 import com.example.ui.screens.DataloggerScreen
 import com.example.ui.screens.DiagnosticScreen
 import com.example.ui.screens.AiDiagnosticScreen
+import com.example.ui.screens.SpecialFunctionsScreen
 import com.example.ui.theme.AstraCyan
 import com.example.ui.theme.CarbonBorder
 import com.example.ui.theme.CarbonCard
@@ -159,6 +161,26 @@ fun MainContent(viewModel: ScannerViewModel) {
                 )
 
                 NavigationBarItem(
+                    selected = currentScreen == AppScreen.SPECIAL_FUNCTIONS,
+                    onClick = { viewModel.setScreen(AppScreen.SPECIAL_FUNCTIONS) },
+                    icon = {
+                        Icon(
+                            Icons.Default.Build,
+                            contentDescription = "Ajustes & Atuadores"
+                        )
+                    },
+                    label = { Text("Ajustes", fontSize = 10.sp) },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = Color.Black,
+                        selectedTextColor = GmAmber,
+                        indicatorColor = GmAmber,
+                        unselectedIconColor = TextMuted,
+                        unselectedTextColor = TextMuted
+                    ),
+                    modifier = Modifier.testTag("nav_special_functions")
+                )
+
+                NavigationBarItem(
                     selected = currentScreen == AppScreen.AI_DIAGNOSTIC,
                     onClick = { viewModel.setScreen(AppScreen.AI_DIAGNOSTIC) },
                     icon = {
@@ -203,7 +225,7 @@ fun MainContent(viewModel: ScannerViewModel) {
                     onClick = { viewModel.setScreen(AppScreen.DATALOGGER) },
                     icon = {
                         Icon(
-                            Icons.Default.ListAlt,
+                            Icons.AutoMirrored.Filled.ListAlt,
                             contentDescription = "Datalogger"
                         )
                     },
@@ -232,6 +254,7 @@ fun MainContent(viewModel: ScannerViewModel) {
                     onNavigateToDashboard = { viewModel.setScreen(AppScreen.DASHBOARD) }
                 )
                 AppScreen.DASHBOARD -> DashboardScreen(viewModel = viewModel)
+                AppScreen.SPECIAL_FUNCTIONS -> SpecialFunctionsScreen(viewModel = viewModel)
                 AppScreen.AI_DIAGNOSTIC -> AiDiagnosticScreen(viewModel = viewModel)
                 AppScreen.DIAGNOSTICS -> DiagnosticScreen(viewModel = viewModel)
                 AppScreen.DATALOGGER -> DataloggerScreen(viewModel = viewModel)

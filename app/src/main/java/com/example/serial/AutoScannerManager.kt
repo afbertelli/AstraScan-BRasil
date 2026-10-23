@@ -32,7 +32,19 @@ class AutoScannerManager(
     val identificationEngine = EcuIdentificationEngine(
         scope = scope,
         commandSender = { cmd, timeoutMs -> connectionEngine.sendCommand(cmd, timeoutMs) },
-        logCallback = { msg -> connectionEngine.logTerminal(msg) }
+        logCallback = { msg -> connectionEngine.logTerminal(msg) },
+        onPhysicalConnectionChanged = { isPhysical ->
+            connectionEngine.setPhysicalEcuConnected(isPhysical)
+        }
+    )
+
+    // MÓDULO 3: Funções Especiais, Resets e Atuadores Seguros GM
+    val specialFunctionsEngine = AstraSpecialFunctionsEngine(
+        scope = scope,
+        commandSender = { cmd, timeoutMs -> connectionEngine.sendCommand(cmd, timeoutMs) },
+        logCallback = { msg -> connectionEngine.logTerminal(msg) },
+        pauseTelemetry = { identificationEngine.pauseTelemetry() },
+        resumeTelemetry = { identificationEngine.resumeTelemetry() }
     )
 
     // Delegação reativa de estados para compatibilidade direta com a UI e ViewModels
@@ -40,6 +52,9 @@ class AutoScannerManager(
     val statusMessage: StateFlow<String> = connectionEngine.statusMessage
     val detectedProtocol: StateFlow<ProtocolType> = connectionEngine.detectedProtocol
     val isConnected: StateFlow<Boolean> = connectionEngine.isConnected
+    val isBluetoothConnected: StateFlow<Boolean> = connectionEngine.isBluetoothConnected
+    val isPhysicalEcuConnected: StateFlow<Boolean> = connectionEngine.isPhysicalEcuConnected
+    val isManualProfileConfigured: StateFlow<Boolean> = connectionEngine.isManualProfileConfigured
     val terminalLogs: StateFlow<List<String>> = connectionEngine.terminalLogs
 
     val vehicleProfile: StateFlow<VehicleProfile> = identificationEngine.vehicleProfile
@@ -118,8 +133,15 @@ class AutoScannerManager(
         return connectionEngine.sendCommand(cmd, timeoutMs)
     }
 
+    fun selectEcuProfile(profile: VehicleProfile) {
+        identificationEngine.setVehicleProfile(profile)
+        connectionEngine.setManualProfileConfigured(profile)
+        logTerminal("Perfil de ECU configurado manualmente: ${profile.ecuName} [${profile.engineCode}]")
+    }
+
     fun disconnect() {
         scanJob?.cancel()
+        specialFunctionsEngine.abortCurrentTest()
         identificationEngine.reset()
         connectionEngine.disconnect()
     }

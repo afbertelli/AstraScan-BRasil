@@ -54,7 +54,7 @@ data class AiDiagnosticReport(
 object AiDiagnosticEngine {
 
     private const val TAG = "AiDiagnosticEngine"
-    private const val GEMINI_MODEL = "gemini-3.5-flash"
+    private const val GEMINI_MODEL = "gemini-2.5-flash"
     private const val BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models/$GEMINI_MODEL:generateContent"
 
     private val okHttpClient = OkHttpClient.Builder()
@@ -93,23 +93,26 @@ object AiDiagnosticEngine {
         )
 
         // 2. Temperatura do Arrefecimento (ECT)
+        // Calibração OEM GM Família II: Válvula termostática abre a 87°C/92°C. 
+        // 1ª velocidade do eletroventilador arma a 98°C-100°C; 2ª velocidade arma a 102°C-105°C.
         val ectStatus = when {
-            t.coolantTempC > 102f -> ComponentStatus.ALERT
-            t.coolantTempC in 98f..102f -> ComponentStatus.WARNING
-            t.coolantTempC < 75f && t.speedKmh > 40f -> ComponentStatus.WARNING // Termostática travada aberta
+            t.coolantTempC > 106f -> ComponentStatus.ALERT
+            t.coolantTempC in 101f..106f -> ComponentStatus.WARNING
+            t.coolantTempC < 78f && t.speedKmh > 35f -> ComponentStatus.WARNING // Termostática travada aberta
             else -> ComponentStatus.OK
         }
         list.add(
             ComponentAudit(
                 name = "Sensor de Temperatura da Água (ECT)",
                 currentValue = String.format(Locale.US, "%.1f", t.coolantTempC),
-                acceptableRange = "88.0 - 98.0",
+                acceptableRange = "85.0 - 102.0 (Alerta: >106°C)",
                 unit = "°C",
                 status = ectStatus,
                 diagnosisNote = when {
-                    t.coolantTempC > 100f -> "Temperatura crítica: risco de queima da junta do cabeçote ou falha de acionamento do eletroventilador."
-                    t.coolantTempC < 75f && t.speedKmh > 30f -> "Motor trabalhando frio em rodovia: provável válvula termostática travada aberta ou ausente."
-                    else -> "Faixa térmica de operação ideal."
+                    t.coolantTempC > 106f -> "Superaquecimento crítico: ventoinha não acionou, bomba d'água sem fluxo ou junta queimada."
+                    t.coolantTempC in 101f..106f -> "Temperatura elevada: eletroventilador deve estar operando no 2º estágio (102°C-105°C)."
+                    t.coolantTempC < 78f && t.speedKmh > 35f -> "Motor trabalhando frio em rodovia: provável válvula termostática travada aberta ou ausente."
+                    else -> "Faixa térmica de operação ideal GM."
                 }
             )
         )
@@ -128,11 +131,12 @@ object AiDiagnosticEngine {
         )
 
         // 4. Pressão Absoluta no Coletor (MAP)
+        // Calibração OEM GM Astra 2.0 8V: Lenta sem ar: 28 a 40 kPa; com A/C ligado: 42 a 52 kPa; WOT: ~95-102 kPa
         val mapStatus = if (isIdle) {
             when {
-                t.mapKpa > 46f -> ComponentStatus.ALERT
-                t.mapKpa in 41f..46f -> ComponentStatus.WARNING
-                t.mapKpa < 26f -> ComponentStatus.WARNING
+                t.mapKpa > 54f -> ComponentStatus.ALERT
+                t.mapKpa in 45f..54f -> ComponentStatus.WARNING
+                t.mapKpa < 25f -> ComponentStatus.WARNING
                 else -> ComponentStatus.OK
             }
         } else ComponentStatus.OK
@@ -140,43 +144,59 @@ object AiDiagnosticEngine {
             ComponentAudit(
                 name = "Sensor de Pressão no Coletor (MAP)",
                 currentValue = "${t.mapKpa.toInt()}",
-                acceptableRange = if (isIdle) "28 - 40" else "25 - 105",
+                acceptableRange = if (isIdle) "28 - 42 kPa (até 50 com A/C)" else "25 - 105 kPa",
                 unit = "kPa",
                 status = mapStatus,
-                diagnosisNote = if (isIdle && t.mapKpa > 42f) "Pressão no coletor elevada na lenta: indício claro de entrada falsa de ar, mangueira de vácuo solta, ponto atrasado ou sincronismo de correia dentada fora." else "Vácuo e vedação do coletor normais."
+                diagnosisNote = if (isIdle && t.mapKpa > 45f) "Pressão elevada na marcha lenta: verifique ar-condicionado acoplado, entrada falsa de ar ou ponto de ignição atrasado." else "Vácuo e vedação do coletor normais."
             )
         )
 
         // 5. Vácuo Derivado do Coletor
-        val vacStatus = if (isIdle && t.manifoldVacuumBar < 0.55f) ComponentStatus.WARNING else ComponentStatus.OK
+        val vacStatus = if (isIdle && t.manifoldVacuumBar < 0.50f) ComponentStatus.WARNING else ComponentStatus.OK
         list.add(
             ComponentAudit(
                 name = "Vácuo Efetivo do Coletor",
                 currentValue = String.format(Locale.US, "%.2f", t.manifoldVacuumBar),
-                acceptableRange = if (isIdle) "0.58 - 0.72" else "0.00 - 0.80",
+                acceptableRange = if (isIdle) "0.55 - 0.72" else "0.00 - 0.80",
                 unit = "bar",
                 status = vacStatus,
                 diagnosisNote = if (vacStatus != ComponentStatus.OK) "Vácuo baixo no coletor de admissão." else "Depressão do coletor adequada."
             )
         )
 
-        // 6. Tempo de Injeção (T.I.)
+        // 6. Tempo de Injeção (T.I.) Calibrado por Combustível (Gasolina vs Etanol)
+        // Gasolina (E27): 1.80 a 2.60 ms na lenta
+        // Etanol (E100): 2.80 a 4.20 ms na lenta (+30-40% estequiometria)
+        val isEthanol = t.ethanolPercentage > 50f || (t.estimatedAfRatio in 8.5f..11.5f)
         val tiStatus = if (isIdle) {
-            when {
-                t.injectionTimeMs > 3.8f -> ComponentStatus.ALERT
-                t.injectionTimeMs > 3.3f -> ComponentStatus.WARNING
-                t.injectionTimeMs < 1.6f -> ComponentStatus.WARNING
-                else -> ComponentStatus.OK
+            if (isEthanol) {
+                when {
+                    t.injectionTimeMs > 4.8f -> ComponentStatus.ALERT
+                    t.injectionTimeMs > 4.3f -> ComponentStatus.WARNING
+                    t.injectionTimeMs < 2.3f -> ComponentStatus.WARNING
+                    else -> ComponentStatus.OK
+                }
+            } else {
+                when {
+                    t.injectionTimeMs > 3.6f -> ComponentStatus.ALERT
+                    t.injectionTimeMs > 2.8f -> ComponentStatus.WARNING
+                    t.injectionTimeMs < 1.5f -> ComponentStatus.WARNING
+                    else -> ComponentStatus.OK
+                }
             }
         } else ComponentStatus.OK
         list.add(
             ComponentAudit(
                 name = "Tempo de Injeção (T.I.)",
                 currentValue = String.format(Locale.US, "%.2f", t.injectionTimeMs),
-                acceptableRange = if (isIdle) "1.80 - 3.20" else "1.50 - 18.00",
+                acceptableRange = if (isIdle) {
+                    if (isEthanol) "2.80 - 4.20 (Etanol)" else "1.80 - 2.60 (Gasolina)"
+                } else "1.50 - 18.00",
                 unit = "ms",
                 status = tiStatus,
-                diagnosisNote = if (isIdle && t.injectionTimeMs > 3.3f) "Tempo de injeção excessivo na marcha lenta (central enriquecendo para compensar falta de combustível ou leitura alta de MAP)." else "Pulso dos eletroinjetores calibrado."
+                diagnosisNote = if (isIdle && tiStatus != ComponentStatus.OK) {
+                    if (isEthanol) "Tempo de injeção em etanol fora da faixa nominal (2.8 - 4.2 ms)." else "Tempo de injeção em gasolina fora da faixa nominal (1.8 - 2.6 ms)."
+                } else "Pulso dos eletroinjetores calibrado para o combustível."
             )
         )
 
@@ -206,13 +226,13 @@ object AiDiagnosticEngine {
             )
         )
 
-        // 9. Tensão da Pista 1 do TPS
-        val tpsVStatus = if (isIdle && (t.throttleVoltage1 > 1.1f || t.throttleVoltage1 < 0.35f)) ComponentStatus.WARNING else ComponentStatus.OK
+        // 9. Tensão da Pista 1 do TPS e Redundância DBW (se disponível)
+        val tpsVStatus = if (isIdle && (t.throttleVoltage1 > 1.1f || (t.throttleVoltage1 > 0f && t.throttleVoltage1 < 0.40f))) ComponentStatus.WARNING else ComponentStatus.OK
         list.add(
             ComponentAudit(
                 name = "Tensão TPS Potenciômetro 1",
                 currentValue = String.format(Locale.US, "%.2f", t.throttleVoltage1),
-                acceptableRange = if (isIdle) "0.45 - 0.90" else "0.45 - 4.60",
+                acceptableRange = if (isIdle) "0.50 - 0.90" else "0.50 - 4.60",
                 unit = "V",
                 status = tpsVStatus,
                 diagnosisNote = if (tpsVStatus != ComponentStatus.OK) "Tensão fora da curva de calibração OEM (desgaste na pista do sensor)." else "Sinal elétrico da pista linear."
@@ -452,24 +472,25 @@ Gere uma resposta técnica estruturada em Português do Brasil com:
             .post(requestBody)
             .build()
 
-        val response = okHttpClient.newCall(request).execute()
-        if (!response.isSuccessful) {
-            Log.e(TAG, "Gemini API HTTP Error: ${response.code} - ${response.message}")
+        okHttpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                Log.e(TAG, "Gemini API HTTP Error: ${response.code} - ${response.message}")
+                return null
+            }
+
+            val respBody = response.body?.string() ?: return null
+            val respJson = JSONObject(respBody)
+            val candidates = respJson.optJSONArray("candidates") ?: return null
+            if (candidates.length() > 0) {
+                val candidate = candidates.getJSONObject(0)
+                val content = candidate.optJSONObject("content")
+                val parts = content?.optJSONArray("parts")
+                if (parts != null && parts.length() > 0) {
+                    return parts.getJSONObject(0).optString("text")
+                }
+            }
             return null
         }
-
-        val respBody = response.body?.string() ?: return null
-        val respJson = JSONObject(respBody)
-        val candidates = respJson.optJSONArray("candidates") ?: return null
-        if (candidates.length() > 0) {
-            val candidate = candidates.getJSONObject(0)
-            val content = candidate.optJSONObject("content")
-            val parts = content?.optJSONArray("parts")
-            if (parts != null && parts.length() > 0) {
-                return parts.getJSONObject(0).optString("text")
-            }
-        }
-        return null
     }
 
     private fun parseGeminiDiagnostic(

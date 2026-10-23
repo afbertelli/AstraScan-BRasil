@@ -67,7 +67,11 @@ class TelemetryForegroundService : Service() {
             ACTION_STOP_LOGGING -> stopLoggingSession()
         }
         val notification = buildNotification("AstraScan Conectado", "Telemetria e monitoramento de barramento ativos.")
-        startForeground(NOTIFICATION_ID, notification)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notification, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
         return START_STICKY
     }
 

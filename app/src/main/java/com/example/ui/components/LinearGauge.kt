@@ -54,7 +54,10 @@ fun LinearGauge(
     warningThreshold: Float? = null,
     isWarningHigh: Boolean = true
 ) {
-    val fraction = ((value - minValue) / (maxValue - minValue)).coerceIn(0f, 1f)
+    val safeMin = if (minValue.isNaN()) 0f else minValue
+    val safeMax = if (maxValue.isNaN() || maxValue <= safeMin) safeMin + 1f else maxValue
+    val safeValue = if (value.isNaN()) safeMin else value
+    val fraction = ((safeValue - safeMin) / (safeMax - safeMin)).coerceIn(0f, 1f)
     val animatedFraction by animateFloatAsState(
         targetValue = fraction,
         animationSpec = tween(durationMillis = 200),
@@ -62,9 +65,9 @@ fun LinearGauge(
     )
 
     val isWarning = warningThreshold != null && if (isWarningHigh) {
-        value >= warningThreshold
+        safeValue >= warningThreshold
     } else {
-        value <= warningThreshold
+        safeValue <= warningThreshold
     }
 
     val activeColor = if (isWarning) AstraRedline else barColor
@@ -94,7 +97,7 @@ fun LinearGauge(
             )
             Row(verticalAlignment = Alignment.Bottom) {
                 Text(
-                    text = formatString.format(value),
+                    text = formatString.format(safeValue),
                     fontSize = 18.sp,
                     fontWeight = FontWeight.Bold,
                     fontFamily = FontFamily.Monospace,

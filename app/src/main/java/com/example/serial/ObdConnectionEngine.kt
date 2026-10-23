@@ -5,8 +5,10 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothSocket
 import android.util.Log
+import com.example.model.AstraModule
 import com.example.model.ProtocolType
 import com.example.model.ScanState
+import com.example.model.TimeoutCalibration
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -21,12 +23,15 @@ import java.util.UUID
 
 /**
  * MÓDULO 1: GERENCIADOR DE CONEXÃO FÍSICA E ESTABILIDADE SERIAL
- * Responsabilidade única:
+ * Responsabilidade:
  * - Abertura resiliente de sockets Bluetooth RFCOMM/SPP com triplo fallback.
  * - Reset e parametrização segura de buffers do chip ELM327.
  * - Negociação progressiva de protocolos na Linha K e CAN (KWP2000 Fast/Slow, ISO 9141-2, CAN).
- * - Monitoramento contínuo (Watchdog Keep-Alive) para impedir timeout da ECU física.
- * - Fila thread-safe de comandos seriais com recuperação contra ruídos e quedas.
+ * - Monitoramento contínuo (Watchdog Keep-Alive 3E Tester Present) para impedir timeout da ECU física.
+ * - Resiliência a queda de tensão no arranque do motor (cranking drop).
+ * - Suporte a múltiplos módulos Astra (Injeção, Painel MID, Câmbio Aisin, ABS, Airbag, Imobilizador).
+ * - Atalho de conexão rápida (Bypass do último perfil de sucesso).
+ * - Calibração de timeout adaptativo do chip ELM327 (AT ST).
  */
 class ObdConnectionEngine(
     private val scope: CoroutineScope
@@ -50,20 +55,46 @@ class ObdConnectionEngine(
     private val _isConnected = MutableStateFlow(false)
     val isConnected: StateFlow<Boolean> = _isConnected.asStateFlow()
 
+    private val _isBluetoothConnected = MutableStateFlow(false)
+    val isBluetoothConnected: StateFlow<Boolean> = _isBluetoothConnected.asStateFlow()
+
+    private val _isPhysicalEcuConnected = MutableStateFlow(false)
+    val isPhysicalEcuConnected: StateFlow<Boolean> = _isPhysicalEcuConnected.asStateFlow()
+
+    private val _isManualProfileConfigured = MutableStateFlow(false)
+    val isManualProfileConfigured: StateFlow<Boolean> = _isManualProfileConfigured.asStateFlow()
+
     private val _batteryVoltage = MutableStateFlow(12.6f)
     val batteryVoltage: StateFlow<Float> = _batteryVoltage.asStateFlow()
 
     private val _terminalLogs = MutableStateFlow<List<String>>(emptyList())
     val terminalLogs: StateFlow<List<String>> = _terminalLogs.asStateFlow()
 
+    // Configurações Avançadas e Opções da Conexão
+    val selectedModule = MutableStateFlow(AstraModule.ENGINE_PRIMARY)
+    val timeoutCalibration = MutableStateFlow(TimeoutCalibration.BALANCED)
+    val isFastBypassEnabled = MutableStateFlow(true)
+    val isAutoReconnectOnDropEnabled = MutableStateFlow(true)
+    val lastSuccessfulProfile = MutableStateFlow<String?>("PERFIL_1_KWP_FAST_11")
+
     private var activeSocket: BluetoothSocket? = null
+    private var activeDevice: BluetoothDevice? = null
     private var keepAliveJob: Job? = null
     private var lastTrafficTimestamp: Long = 0L
+    var lastPhysicalEcuResponseTimestamp: Long = 0L
+        private set
+
+    fun notifyPhysicalDataReceived() {
+        lastPhysicalEcuResponseTimestamp = System.currentTimeMillis()
+        if (!_isPhysicalEcuConnected.value) {
+            setPhysicalEcuConnected(true)
+        }
+    }
 
     fun logTerminal(msg: String) {
         val formatted = "[${System.currentTimeMillis() % 100000}] $msg"
         val current = _terminalLogs.value.toMutableList()
-        if (current.size > 200) current.removeAt(0)
+        if (current.size > 250) current.removeAt(0)
         current.add(formatted)
         _terminalLogs.value = current
         Log.d(TAG, msg)
@@ -72,6 +103,42 @@ class ObdConnectionEngine(
     fun updateScanState(state: ScanState, message: String) {
         _scanState.value = state
         _statusMessage.value = message
+        if (state == ScanState.CONNECTED) {
+            _isConnected.value = true
+        } else if (state == ScanState.IDLE || state == ScanState.ERROR) {
+            if (activeSocket == null || !activeSocket!!.isConnected) {
+                _isConnected.value = false
+                _isPhysicalEcuConnected.value = false
+            }
+        }
+    }
+
+    fun setPhysicalEcuConnected(connected: Boolean) {
+        _isPhysicalEcuConnected.value = connected
+        _isConnected.value = connected
+        if (connected) {
+            lastPhysicalEcuResponseTimestamp = System.currentTimeMillis()
+            _isBluetoothConnected.value = true
+        }
+    }
+
+    fun setManualProfileConfigured(profile: com.example.model.VehicleProfile) {
+        _isManualProfileConfigured.value = true
+        val hasBt = activeSocket != null && activeSocket!!.isConnected
+        _isBluetoothConnected.value = hasBt
+        _isPhysicalEcuConnected.value = false
+        _isConnected.value = false
+        if (hasBt) {
+            updateScanState(
+                ScanState.IDLE,
+                "Perfil ${profile.ecuName} configurado. Adaptador Bluetooth pronto. Inicie a conexão para ler a ECU."
+            )
+        } else {
+            updateScanState(
+                ScanState.IDLE,
+                "Perfil ${profile.ecuName} configurado. Adaptador Bluetooth desconectado (conecte ao carro para telemetria real)."
+            )
+        }
     }
 
     suspend fun sendCommand(cmd: String, timeoutMs: Long = 1800L): String {
@@ -81,15 +148,16 @@ class ObdConnectionEngine(
 
     /**
      * Executa a rotina completa de conexão física e handshake de protocolo.
-     * Retorna true se a conexão física e o protocolo da ECU responderam com sucesso.
      */
     @SuppressLint("MissingPermission")
     suspend fun connectAndHandshake(device: BluetoothDevice): Boolean {
+        activeDevice = device
         updateScanState(ScanState.CONNECTING_BLUETOOTH, "Conectando ao adaptador ${device.name ?: device.address}...")
         logTerminal("Iniciando conexão física com: ${device.name} [${device.address}]")
 
         var connectedSocket: BluetoothSocket? = null
         try {
+            @Suppress("DEPRECATION")
             BluetoothAdapter.getDefaultAdapter()?.cancelDiscovery()
             val s = device.createRfcommSocketToServiceRecord(SPP_UUID)
             s.connect()
@@ -118,154 +186,544 @@ class ObdConnectionEngine(
 
         activeSocket = connectedSocket
         serialQueue.updateSocket(connectedSocket)
-        _isConnected.value = true
+        _isBluetoothConnected.value = true
+        _isPhysicalEcuConnected.value = false
+        _isConnected.value = false
 
-        updateScanState(ScanState.RESETTING_ELM327, "Inicializando ELM327 e testando tensão...")
-        logTerminal("Enviando reset AT Z e configurando parâmetros base...")
+        updateScanState(ScanState.RESETTING_ELM327, "Adaptador conectado. Inicializando chip e testando bateria...")
+        val stCmd = timeoutCalibration.value.atCommand
+        logTerminal("Configurando parâmetros base ELM327 (AT Z, AT E0, AT L0, AT S1, AT H0, AT AT 1, AT KW 0, $stCmd)...")
 
         val zResp = sendCommand("AT Z", timeoutMs = 2500L)
         logTerminal("< AT Z: $zResp")
-        delay(400)
+        delay(350)
 
-        sendCommand("AT D")
-        sendCommand("AT E0")
-        sendCommand("AT L0")
-        sendCommand("AT S0")
-        sendCommand("AT AT 1")
-        sendCommand("AT CAF 1")
+        sendCommand("AT E0", timeoutMs = 600L)
+        sendCommand("AT L0", timeoutMs = 600L)
+        sendCommand("AT S1", timeoutMs = 600L)
+        sendCommand("AT H0", timeoutMs = 600L) // Headers OFF: respostas 41 XX limpas para parse direto
+        sendCommand("AT AT 1", timeoutMs = 600L) // Timing Adaptativo
+        sendCommand("AT KW 0", timeoutMs = 600L) // Desativa checagem estrita de keywords para clones
+        sendCommand(stCmd, timeoutMs = 600L)
 
-        val voltRaw = sendCommand("AT RV")
+        val voltRaw = sendCommand("AT RV", timeoutMs = 800L)
         logTerminal("< Tensão Bateria ELM (AT RV): $voltRaw")
         val parsedVolt = GmDataParsers.parseElmVoltage(voltRaw) ?: 12.6f
         _batteryVoltage.value = parsedVolt
 
         val protocolFound = runProtocolCascade()
         if (!protocolFound) {
-            updateScanState(ScanState.ERROR, "A central não respondeu na Linha K / OBD-II. Verifique a ignição.")
-            logTerminal("ERRO: Nenhum protocolo GM respondeu na linha física.")
+            _isPhysicalEcuConnected.value = false
+            _isConnected.value = false
+            updateScanState(ScanState.ERROR, "Adaptador conectado, mas a ECU física não respondeu. Ligue a ignição do carro.")
+            logTerminal("ERRO: Nenhum perfil de protocolo GM respondeu na linha física.")
             return false
         }
 
+        _isPhysicalEcuConnected.value = true
+        _isConnected.value = true
+        updateScanState(ScanState.CONNECTED, "Conectado em tempo real com a ECU física do veículo!")
         startKeepAliveWorker()
         return true
     }
 
     /**
-     * Cascata de protocolos especializada GM Brasil
+     * Aplica rotina de recuperação e cooldown da Linha K física (Pino 7).
+     * Fecha protocolo anterior (AT PC) sem reiniciar o chip ELM para evitar travamentos.
      */
-    private suspend fun runProtocolCascade(): Boolean {
-        // Tentativa 1: Auto-detecção nativa ELM327 (AT SP 0)
-        updateScanState(ScanState.TESTING_ISO_9141, "Testando auto-detecção de protocolo OBD-II...")
-        logTerminal("Testando auto-detecção nativa ELM327 (AT SP 0)")
+    private suspend fun aplicarRecuperacaoLinhaK() {
+        logTerminal("Recuperação Linha K: Fechando sessão anterior (AT PC)...")
+        try {
+            sendCommand("AT PC", timeoutMs = 800L)
+            delay(150)
+            sendCommand("AT E0", timeoutMs = 400L)
+            sendCommand("AT L0", timeoutMs = 400L)
+            sendCommand("AT H0", timeoutMs = 400L)
+        } catch (e: Exception) {
+            logTerminal("Aviso na rotina de recuperação: ${e.message}")
+        }
+    }
 
-        sendCommand("AT SP 0")
-        sendCommand("AT AR")
-        sendCommand("AT CAF 1")
-        val autoResp = sendCommand("01 00", timeoutMs = 3500L)
-        logTerminal("< 01 00 (Auto SP 0): $autoResp")
-
-        if (autoResp.contains("41 00")) {
-            val dpResp = sendCommand("AT DP")
-            logTerminal("< Protocolo detectado pelo ELM (AT DP): $dpResp")
-            _detectedProtocol.value = when {
-                dpResp.contains("CAN", true) -> ProtocolType.CAN_500K
-                dpResp.contains("KWP", true) -> ProtocolType.KWP_FAST
-                else -> ProtocolType.ISO_9141
+    /**
+     * Diagnostica erros típicos de hardware do chip ELM327
+     */
+    private fun diagnosticarRespostaELM(resposta: String) {
+        when {
+            resposta.contains("FB ERROR", ignoreCase = true) -> {
+                logTerminal("ALERTA DE HARDWARE: 'FB ERROR' detectado! Linha K (Pino 7) com ruído, curto ou ignição do carro desligada.")
             }
+            resposta.contains("BUS INIT: ERROR", ignoreCase = true) -> {
+                logTerminal("DIAGNÓSTICO: 'BUS INIT: ERROR' - A central não aceitou a inicialização neste endereço.")
+            }
+            resposta.contains("UNABLE TO CONNECT", ignoreCase = true) -> {
+                logTerminal("DIAGNÓSTICO: 'UNABLE TO CONNECT' - Impossível conectar com a taxa de baud/protocolo selecionado.")
+            }
+            resposta.contains("?", ignoreCase = true) || resposta.contains("ERROR", ignoreCase = true) -> {
+                logTerminal("AVISO DE CHIP: Comando rejeitado ('?' ou 'ERROR'). Verifique se o adaptador é um clone ELM327 v2.1 instável.")
+            }
+        }
+    }
+
+    /**
+     * Valida se a central física respondeu com dados reais após a inicialização do barramento
+     */
+    /**
+     * Valida se a central física respondeu com dados reais após a inicialização do barramento.
+     * Suporta múltiplas camadas de detecção: 01 00 (PIDs suportados), 01 0C (RPM direto),
+     * 01 05 (ECT temperatura), 21 01 (KWP GM) e 1A 90 (ID física GM) para garantir conexão com ECUs antigas.
+     */
+    private suspend fun validarRespostaCentral(): Boolean {
+        // Camada 1: Modo SAE J1979 padrão OBD2 (01 00)
+        val resp00 = sendCommand("01 00", timeoutMs = 2000L)
+        logTerminal("< Teste 01 00 (SAE J1979): $resp00")
+        if (resp00.contains("41 00") || resp00.contains("41 0C") || resp00.contains("41 05")) {
+            logTerminal("SUCESSO: Central física respondeu no modo OBD-II (01 00).")
             return true
         }
 
-        // Tentativa 2: KWP2000 Fast Init (AT SP 5) - Padrão Astra Linha K (Bosch / Delphi)
-        updateScanState(ScanState.TESTING_KWP_FAST, "Testando KWP2000 Fast Init Linha K (Bosch / Delphi)...")
-        logTerminal("Testando KWP2000 Fast Init (AT SP 5)")
-
-        sendCommand("AT SP 5")
-        sendCommand("AT IB 10")
-        sendCommand("AT ST 64")
-        sendCommand("AT SW 20")
-
-        // 1. Inicia com header de 1 byte 81 11 F1 para o StartCommunication (81)
-        sendCommand("AT SH 81 11 F1")
-        var fastInitResp = sendCommand("81", timeoutMs = 2500L)
-        logTerminal("< Init 81 (Header 11): $fastInitResp")
-
-        if (fastInitResp.contains("C1") || (fastInitResp.contains("BUS INIT: OK") && !fastInitResp.contains("ERROR"))) {
-            // Após inicialização 81, configura header para 2 bytes (82 11 F1)
-            sendCommand("AT SH 82 11 F1")
-            val verifyResp = sendCommand("01 00", timeoutMs = 2000L)
-            logTerminal("< Verificação 01 00 (Header 11): $verifyResp")
-            _detectedProtocol.value = ProtocolType.KWP_FAST
-            logTerminal("SUCESSO: KWP2000 Fast Init confirmado (Header 11).")
+        // Camada 2: Consulta direta de RPM (01 0C) - muitas centrais antigas respondem 01 0C mesmo ignorando 01 00
+        val resp0C = sendCommand("01 0C", timeoutMs = 1500L)
+        logTerminal("< Teste 01 0C (RPM direto): $resp0C")
+        if (resp0C.contains("41 0C")) {
+            logTerminal("SUCESSO: Central física respondeu com RPM ativo (01 0C).")
             return true
         }
 
-        // Tenta Header 10 alternativo
-        sendCommand("AT SH 81 10 F1")
-        fastInitResp = sendCommand("81", timeoutMs = 2500L)
-        logTerminal("< Init 81 (Header 10): $fastInitResp")
-        if (fastInitResp.contains("C1") || (fastInitResp.contains("BUS INIT: OK") && !fastInitResp.contains("ERROR"))) {
-            sendCommand("AT SH 82 10 F1")
-            _detectedProtocol.value = ProtocolType.KWP_FAST
-            logTerminal("SUCESSO: KWP2000 Fast Init confirmado (Header 10).")
+        // Camada 3: Consulta direta de Temperatura de Água (01 05) - universal em injeções GM
+        val resp05 = sendCommand("01 05", timeoutMs = 1500L)
+        logTerminal("< Teste 01 05 (ECT Temperatura): $resp05")
+        if (resp05.contains("41 05")) {
+            logTerminal("SUCESSO: Central física respondeu com Temperatura (01 05).")
             return true
         }
 
-        // Tentativa 3: KWP2000 5-Baud Slow Init (AT SP 4)
-        updateScanState(ScanState.TESTING_KWP_SLOW, "Tentando KWP2000 Slow Init 5-Baud...")
-        logTerminal("Testando KWP2000 Slow Init 5-Baud (AT SP 4)")
-
-        sendCommand("AT SP 4")
-        sendCommand("AT IIA 11")
-        sendCommand("AT SH 81 11 F1")
-        val slowInitResp = sendCommand("81", timeoutMs = 2500L)
-        logTerminal("< Init 81 (Slow Header 11): $slowInitResp")
-
-        if (slowInitResp.contains("C1") || (slowInitResp.contains("BUS INIT: OK") && !slowInitResp.contains("ERROR"))) {
-            sendCommand("AT SH 82 11 F1")
-            _detectedProtocol.value = ProtocolType.KWP_SLOW
-            logTerminal("SUCESSO: KWP2000 Slow Init confirmado.")
+        // Camada 4: Modo GM KWP proprietário (21 01)
+        val respKwp = sendCommand("21 01", timeoutMs = 1500L)
+        logTerminal("< Teste 21 01 (GM KWP): $respKwp")
+        if (respKwp.contains("61 01") || (respKwp.length > 5 && !GmDataParsers.isNegativeResponse(respKwp))) {
+            logTerminal("SUCESSO: Central física respondeu no modo KWP proprietário GM (21 01).")
             return true
         }
 
-        // Tentativa 4: ISO 9141-2 GM (AT SP 3)
-        sendCommand("AT SP 3")
-        sendCommand("AT IIA 11")
-        sendCommand("AT SH 68 6A F1")
-        val iso9141Resp = sendCommand("01 00", timeoutMs = 2500L)
-        logTerminal("< 01 00 (ISO 9141): $iso9141Resp")
-
-        if (iso9141Resp.contains("41 00")) {
-            _detectedProtocol.value = ProtocolType.ISO_9141
-            logTerminal("SUCESSO: ISO 9141-2 confirmado.")
-            return true
-        }
-
-        // Tentativa 5: CAN 11-bit 500k (Astra finais)
-        updateScanState(ScanState.TESTING_CAN, "Testando CAN 11-bit 500k...")
-        sendCommand("AT SP 6")
-        sendCommand("AT SH 7E0")
-        val canResp = sendCommand("01 00", timeoutMs = 2000L)
-        logTerminal("< 01 00 (CAN): $canResp")
-
-        if (canResp.contains("41 00")) {
-            _detectedProtocol.value = ProtocolType.CAN_500K
+        // Camada 5: Leitura de Identificador de Hardware GM (1A 90)
+        val respId = sendCommand("1A 90", timeoutMs = 1500L)
+        logTerminal("< Teste 1A 90 (ID Central GM): $respId")
+        if (respId.contains("5A 90") || (respId.contains("5A") && !GmDataParsers.isNegativeResponse(respId))) {
+            logTerminal("SUCESSO: Central física respondeu com identificador GM (1A 90).")
             return true
         }
 
         return false
     }
 
+    /**
+     * Camada 1: KWP2000 Fast Init - Target 0x11 (Delphi Multec H / MT27E Flexpower)
+     */
+    private suspend fun testProfile1(stCmd: String): Boolean {
+        updateScanState(ScanState.TESTING_KWP_FAST, "Camada 1: KWP2000 Fast Init (Target 0x11 - Delphi Multec H)...")
+        logTerminal("Iniciando Camada 1: KWP2000 Fast Init (AT SP 5, AT SH 81 11 F1, AT WM 81 11 F1 3E, AT IB 10)")
+        sendCommand("AT SP 5", timeoutMs = 600L)
+        sendCommand("AT SH 81 11 F1", timeoutMs = 600L)
+        sendCommand("AT WM 81 11 F1 3E", timeoutMs = 400L)
+        sendCommand("AT IB 10", timeoutMs = 400L)
+        sendCommand("AT AT 1", timeoutMs = 400L)
+        sendCommand("AT KW 0", timeoutMs = 400L)
+        sendCommand(stCmd, timeoutMs = 400L)
+        
+        val resp01 = sendCommand("01 00", timeoutMs = 2800L)
+        logTerminal("< 01 00 (Camada 1 KWP Fast 11): $resp01")
+        diagnosticarRespostaELM(resp01)
+        if (resp01.contains("41 00") || resp01.contains("41 0C") || validarRespostaCentral()) {
+            _detectedProtocol.value = ProtocolType.KWP_FAST
+            logTerminal("SUCESSO: Camada 1 conectada (KWP Fast Init - Delphi Multec H).")
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Camada 2: KWP2000 Fast Init - Target 0x10 (Bosch Motronic ME 7.9.6 / ME 7.9.9 Flexpower)
+     */
+    private suspend fun testProfile2(stCmd: String): Boolean {
+        updateScanState(ScanState.TESTING_KWP_FAST, "Camada 2: KWP2000 Fast Init (Target 0x10 - Bosch ME 7.9.6)...")
+        logTerminal("Iniciando Camada 2: KWP2000 Fast Init (AT SP 5, AT SH 81 10 F1, AT WM 81 10 F1 3E, AT IB 10)")
+        sendCommand("AT SP 5", timeoutMs = 600L)
+        sendCommand("AT SH 81 10 F1", timeoutMs = 600L)
+        sendCommand("AT WM 81 10 F1 3E", timeoutMs = 400L)
+        sendCommand("AT IB 10", timeoutMs = 400L)
+        sendCommand("AT AT 1", timeoutMs = 400L)
+        sendCommand("AT KW 0", timeoutMs = 400L)
+        sendCommand(stCmd, timeoutMs = 400L)
+        
+        val resp = sendCommand("01 00", timeoutMs = 2800L)
+        logTerminal("< 01 00 (Camada 2 KWP Fast 10): $resp")
+        diagnosticarRespostaELM(resp)
+        if (resp.contains("41 00") || resp.contains("41 0C") || validarRespostaCentral()) {
+            _detectedProtocol.value = ProtocolType.KWP_FAST
+            logTerminal("SUCESSO: Camada 2 conectada (KWP Fast Init - Bosch ME 7.9.6).")
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Camada 3: KWP2000 Fast Init - Funcional Padrão 0x33 (ISO 14230-4 Broadcast)
+     */
+    private suspend fun testProfile3(stCmd: String): Boolean {
+        updateScanState(ScanState.TESTING_KWP_FAST, "Camada 3: KWP2000 Fast Init (Padrão ISO 14230-4 0x33)...")
+        logTerminal("Iniciando Camada 3: KWP2000 Fast Init (AT SP 5, AT SH 81 33 F1, AT IB 10)")
+        sendCommand("AT SP 5", timeoutMs = 600L)
+        sendCommand("AT SH 81 33 F1", timeoutMs = 600L)
+        sendCommand("AT IB 10", timeoutMs = 400L)
+        sendCommand("AT AT 1", timeoutMs = 400L)
+        sendCommand(stCmd, timeoutMs = 400L)
+        val resp = sendCommand("01 00", timeoutMs = 2800L)
+        logTerminal("< 01 00 (Camada 3 KWP Fast 33): $resp")
+        diagnosticarRespostaELM(resp)
+        if (resp.contains("41 00") || resp.contains("41 0C") || validarRespostaCentral()) {
+            _detectedProtocol.value = ProtocolType.KWP_FAST
+            logTerminal("SUCESSO: Camada 3 conectada (KWP Fast Init - Padrão ISO 14230-4).")
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Camada 4: KWP2000 Slow Init 5-Baud - Target 0x11 (Astra Delphi Multec F / Multec M)
+     */
+    private suspend fun testProfile4(stCmd: String): Boolean {
+        updateScanState(ScanState.TESTING_KWP_SLOW, "Camada 4: KWP2000 Slow Init 5-Baud (Target 0x11 - Multec Antiga)...")
+        logTerminal("Iniciando Camada 4: KWP2000 Slow Init 5-Baud (AT SP 4, AT IIA 11, AT SH 81 11 F1, AT IB 10)")
+        sendCommand("AT SP 4", timeoutMs = 600L)
+        sendCommand("AT IIA 11", timeoutMs = 600L)
+        sendCommand("AT SH 81 11 F1", timeoutMs = 600L)
+        sendCommand("AT IB 10", timeoutMs = 400L)
+        sendCommand("AT AT 1", timeoutMs = 400L)
+        sendCommand(stCmd, timeoutMs = 400L)
+        val resp = sendCommand("01 00", timeoutMs = 3200L)
+        logTerminal("< 01 00 (Camada 4 KWP Slow 11): $resp")
+        diagnosticarRespostaELM(resp)
+        if (resp.contains("41 00") || resp.contains("41 0C") || validarRespostaCentral()) {
+            _detectedProtocol.value = ProtocolType.KWP_SLOW
+            logTerminal("SUCESSO: Camada 4 conectada (KWP Slow Init - Multec Antiga).")
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Camada 5: KWP2000 Slow Init 5-Baud - Target 0x10 (Astra Bosch ME 7.9.6 Gasolina 2003-2004)
+     */
+    private suspend fun testProfile5(stCmd: String): Boolean {
+        updateScanState(ScanState.TESTING_KWP_SLOW, "Camada 5: KWP2000 Slow Init 5-Baud (Target 0x10 - Bosch Gasolina)...")
+        logTerminal("Iniciando Camada 5: KWP2000 Slow Init 5-Baud (AT SP 4, AT IIA 10, AT SH 81 10 F1, AT IB 10)")
+        sendCommand("AT SP 4", timeoutMs = 600L)
+        sendCommand("AT IIA 10", timeoutMs = 600L)
+        sendCommand("AT SH 81 10 F1", timeoutMs = 600L)
+        sendCommand("AT IB 10", timeoutMs = 400L)
+        sendCommand("AT AT 1", timeoutMs = 400L)
+        sendCommand(stCmd, timeoutMs = 400L)
+        val resp = sendCommand("01 00", timeoutMs = 3200L)
+        logTerminal("< 01 00 (Camada 5 KWP Slow 10): $resp")
+        diagnosticarRespostaELM(resp)
+        if (resp.contains("41 00") || resp.contains("41 0C") || validarRespostaCentral()) {
+            _detectedProtocol.value = ProtocolType.KWP_SLOW
+            logTerminal("SUCESSO: Camada 5 conectada (KWP Slow Init - Bosch Gasolina).")
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Camada 6: KWP2000 Slow Init 5-Baud - Target 0x01 (Astra 2.0 16V Bosch Motronic M 1.5.5)
+     */
+    private suspend fun testProfile6(stCmd: String): Boolean {
+        updateScanState(ScanState.TESTING_KWP_SLOW, "Camada 6: KWP2000 Slow Init 5-Baud (Target 0x01 - Bosch M 1.5.5 16V)...")
+        logTerminal("Iniciando Camada 6: KWP2000 Slow Init 5-Baud (AT SP 4, AT IIA 01, AT SH 81 01 F1, AT IB 10)")
+        sendCommand("AT SP 4", timeoutMs = 600L)
+        sendCommand("AT IIA 01", timeoutMs = 600L)
+        sendCommand("AT SH 81 01 F1", timeoutMs = 600L)
+        sendCommand("AT IB 10", timeoutMs = 400L)
+        sendCommand("AT AT 1", timeoutMs = 400L)
+        sendCommand(stCmd, timeoutMs = 400L)
+        val resp = sendCommand("01 00", timeoutMs = 3200L)
+        logTerminal("< 01 00 (Camada 6 KWP Slow 01): $resp")
+        diagnosticarRespostaELM(resp)
+        if (resp.contains("41 00") || resp.contains("41 0C") || validarRespostaCentral()) {
+            _detectedProtocol.value = ProtocolType.KWP_SLOW
+            logTerminal("SUCESSO: Camada 6 conectada (KWP Slow Init - Bosch Motronic M 1.5.5 16V).")
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Camada 7: ISO 9141-2 Standard GM SAE J1979 (Astra 1998-2003 Gasolina OBD-II)
+     */
+    private suspend fun testProfile7(): Boolean {
+        updateScanState(ScanState.TESTING_ISO_9141, "Camada 7: ISO 9141-2 Padrão SAE (Header 68 6A F1)...")
+        logTerminal("Iniciando Camada 7: ISO 9141-2 Padrão SAE (AT SP 3, AT SH 68 6A F1, AT IIA 33, AT IB 10)")
+        sendCommand("AT SP 3", timeoutMs = 600L)
+        sendCommand("AT SH 68 6A F1", timeoutMs = 600L)
+        sendCommand("AT IIA 33", timeoutMs = 400L)
+        sendCommand("AT IB 10", timeoutMs = 400L)
+        val resp = sendCommand("01 00", timeoutMs = 3200L)
+        logTerminal("< 01 00 (Camada 7 ISO 9141 SAE): $resp")
+        diagnosticarRespostaELM(resp)
+        if (resp.contains("41 00") || resp.contains("41 0C") || resp.contains("41 05") || validarRespostaCentral()) {
+            _detectedProtocol.value = ProtocolType.ISO_9141
+            logTerminal("SUCESSO: Camada 7 conectada (ISO 9141-2 SAE).")
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Camada 8: ISO 9141-2 Direto GM Engine 0x11 (Astra Primeiras Séries e Astra Belga)
+     */
+    private suspend fun testProfile8(): Boolean {
+        updateScanState(ScanState.TESTING_ISO_9141, "Camada 8: ISO 9141-2 Direto GM (Target 0x11)...")
+        logTerminal("Iniciando Camada 8: ISO 9141-2 Direto GM (AT SP 3, AT SH 68 11 F1, AT IIA 11)")
+        sendCommand("AT SP 3", timeoutMs = 600L)
+        sendCommand("AT SH 68 11 F1", timeoutMs = 600L)
+        sendCommand("AT IIA 11", timeoutMs = 400L)
+        val resp = sendCommand("01 00", timeoutMs = 3200L)
+        logTerminal("< 01 00 (Camada 8 ISO 9141 Direto): $resp")
+        diagnosticarRespostaELM(resp)
+        if (resp.contains("41 00") || resp.contains("41 0C") || validarRespostaCentral()) {
+            _detectedProtocol.value = ProtocolType.ISO_9141
+            logTerminal("SUCESSO: Camada 8 conectada (ISO 9141-2 Direto GM).")
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Camada 9: CAN 11-bit 500k (Astra Flexpower 2009-2011 "Locomotiva" 140cv)
+     */
+    private suspend fun testProfile9(): Boolean {
+        updateScanState(ScanState.TESTING_CAN, "Camada 9: CAN 11-bit 500k (Astra 2009-2011)...")
+        logTerminal("Iniciando Camada 9: CAN 11-bit 500k (AT SP 6, AT SH 7E0, AT CRA 7E8)")
+        sendCommand("AT SP 6", timeoutMs = 600L)
+        sendCommand("AT SH 7E0", timeoutMs = 600L)
+        sendCommand("AT CRA 7E8", timeoutMs = 400L)
+        val canResp = sendCommand("01 00", timeoutMs = 2000L)
+        logTerminal("< 01 00 (Camada 9 CAN 11-bit): $canResp")
+        if (canResp.contains("41 00") || canResp.contains("41 0C") || validarRespostaCentral()) {
+            _detectedProtocol.value = ProtocolType.CAN_500K
+            logTerminal("SUCESSO: Camada 9 conectada (CAN 11-bit 500k).")
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Camada 10: CAN 29-bit 500k (Barramento GM Global)
+     */
+    private suspend fun testProfile10(): Boolean {
+        updateScanState(ScanState.TESTING_CAN, "Camada 10: CAN 29-bit 500k (Padrão GM Estendido)...")
+        logTerminal("Iniciando Camada 10: CAN 29-bit 500k (AT SP 7, AT SH 18DB33F1)")
+        sendCommand("AT SP 7", timeoutMs = 600L)
+        sendCommand("AT SH 18DB33F1", timeoutMs = 600L)
+        val canResp = sendCommand("01 00", timeoutMs = 2000L)
+        logTerminal("< 01 00 (Camada 10 CAN 29-bit): $canResp")
+        if (canResp.contains("41 00") || canResp.contains("41 0C") || validarRespostaCentral()) {
+            _detectedProtocol.value = ProtocolType.CAN_500K
+            logTerminal("SUCESSO: Camada 10 conectada (CAN 29-bit 500k).")
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Cascata de protocolos inteligente GM Astra Brasil (10 Camadas de Compatibilidade):
+     * 1. Atalho de perfil memorizado
+     * 2. Auto-busca universal ELM327 (AT SP 0)
+     * 3 a 10. Camadas progressivas cobrindo todos os anos (1998 a 2011) e motores (8V, 16V, Flexpower e Gasolina)
+     */
+    private suspend fun runProtocolCascade(): Boolean {
+        val stCmd = timeoutCalibration.value.atCommand
+
+        // 1. ATALHO DE CONEXÃO RÁPIDA (BYPASS): Tenta primeiro o último perfil memorizado
+        if (isFastBypassEnabled.value && lastSuccessfulProfile.value != null) {
+            val saved = lastSuccessfulProfile.value
+            logTerminal("CONEXÃO RÁPIDA: Testando perfil memorizado ($saved)...")
+            val quickSuccess = when (saved) {
+                "PERFIL_1_KWP_FAST_11" -> testProfile1(stCmd)
+                "PERFIL_2_KWP_FAST_10" -> testProfile2(stCmd)
+                "PERFIL_3_KWP_FAST_33" -> testProfile3(stCmd)
+                "PERFIL_4_KWP_SLOW_11" -> testProfile4(stCmd)
+                "PERFIL_5_KWP_SLOW_10" -> testProfile5(stCmd)
+                "PERFIL_6_KWP_SLOW_01" -> testProfile6(stCmd)
+                "PERFIL_7_ISO_9141_SAE" -> testProfile7()
+                "PERFIL_8_ISO_9141_GM" -> testProfile8()
+                "PERFIL_9_CAN_500K_11" -> testProfile9()
+                "PERFIL_10_CAN_500K_29" -> testProfile10()
+                else -> false
+            }
+            if (quickSuccess) {
+                logTerminal("CONEXÃO RÁPIDA BEM-SUCEDIDA! Tempo de conexão minimizado.")
+                return true
+            } else {
+                logTerminal("Atalho falhou. Aplicando recuperação e iniciando varredura de 10 camadas...")
+                aplicarRecuperacaoLinhaK()
+            }
+        }
+
+        // 2. BUSCA AUTOMÁTICA UNIVERSAL DO ELM327 (AT SP 0)
+        updateScanState(ScanState.TESTING_KWP_FAST, "Executando auto-busca de protocolo no adaptador...")
+        logTerminal("Tentando Auto Protocol Search (AT SP 0 com 01 00)...")
+        sendCommand("AT SP 0", timeoutMs = 600L)
+        val autoResp = sendCommand("01 00", timeoutMs = 3800L)
+        logTerminal("< 01 00 (AT SP 0 Auto): $autoResp")
+        if (autoResp.contains("41 00") || autoResp.contains("41 0C") || autoResp.contains("61 01") || validarRespostaCentral()) {
+            val dpResp = sendCommand("AT DP", timeoutMs = 800L).uppercase()
+            logTerminal("< Protocolo Detectado pelo ELM327: $dpResp")
+            _detectedProtocol.value = when {
+                dpResp.contains("CAN") -> ProtocolType.CAN_500K
+                dpResp.contains("FAST") || dpResp.contains("14230") -> ProtocolType.KWP_FAST
+                dpResp.contains("9141") -> ProtocolType.ISO_9141
+                else -> ProtocolType.KWP_SLOW
+            }
+            lastSuccessfulProfile.value = "PERFIL_1_KWP_FAST_11"
+            return true
+        }
+
+        aplicarRecuperacaoLinhaK()
+
+        // 3. CASCATA ESPECIALIZADA DE 10 CAMADAS GM ASTRA BRASIL
+        if (testProfile1(stCmd)) {
+            lastSuccessfulProfile.value = "PERFIL_1_KWP_FAST_11"
+            return true
+        }
+        aplicarRecuperacaoLinhaK()
+
+        if (testProfile2(stCmd)) {
+            lastSuccessfulProfile.value = "PERFIL_2_KWP_FAST_10"
+            return true
+        }
+        aplicarRecuperacaoLinhaK()
+
+        if (testProfile3(stCmd)) {
+            lastSuccessfulProfile.value = "PERFIL_3_KWP_FAST_33"
+            return true
+        }
+        aplicarRecuperacaoLinhaK()
+
+        if (testProfile4(stCmd)) {
+            lastSuccessfulProfile.value = "PERFIL_4_KWP_SLOW_11"
+            return true
+        }
+        aplicarRecuperacaoLinhaK()
+
+        if (testProfile5(stCmd)) {
+            lastSuccessfulProfile.value = "PERFIL_5_KWP_SLOW_10"
+            return true
+        }
+        aplicarRecuperacaoLinhaK()
+
+        if (testProfile6(stCmd)) {
+            lastSuccessfulProfile.value = "PERFIL_6_KWP_SLOW_01"
+            return true
+        }
+        aplicarRecuperacaoLinhaK()
+
+        if (testProfile7()) {
+            lastSuccessfulProfile.value = "PERFIL_7_ISO_9141_SAE"
+            return true
+        }
+        aplicarRecuperacaoLinhaK()
+
+        if (testProfile8()) {
+            lastSuccessfulProfile.value = "PERFIL_8_ISO_9141_GM"
+            return true
+        }
+        aplicarRecuperacaoLinhaK()
+
+        if (testProfile9()) {
+            lastSuccessfulProfile.value = "PERFIL_9_CAN_500K_11"
+            return true
+        }
+        aplicarRecuperacaoLinhaK()
+
+        if (testProfile10()) {
+            lastSuccessfulProfile.value = "PERFIL_10_CAN_500K_29"
+            return true
+        }
+
+        return false
+    }
+
+    /**
+     * Comuta o endereçamento da Linha K para comunicar com outro módulo do Astra (ABS, Airbag, MID, Câmbio)
+     */
+    suspend fun switchModule(module: AstraModule): Boolean {
+        selectedModule.value = module
+        logTerminal("Comutando barramento de diagnóstico para: ${module.title} (Target 0x${module.targetHex})")
+        sendCommand("AT SH ${module.headerKwp}")
+        val resp = sendCommand("1A 90", timeoutMs = 1500L)
+        logTerminal("< Resposta do módulo: $resp")
+        return !resp.contains("ERROR") && !resp.contains("NO DATA")
+    }
+
+    /**
+     * Watchdog de manutenção de sessão:
+     * - Envia 3E (Tester Present) a cada 2000ms para impedir que a ECU feche o canal.
+     * - Monitora periodicamente a tensão da bateria.
+     * - Se a tensão cair (partida do motor) ou se o socket cair, executa auto-reconexão silenciosa.
+     */
     private fun startKeepAliveWorker() {
         keepAliveJob?.cancel()
         keepAliveJob = scope.launch(Dispatchers.IO) {
+            var consecutiveErrors = 0
             while (isActive) {
                 delay(2000)
+
+                // Watchdog: Timeout se a ECU física estiver conectada mas ficar > 5s sem responder dados
+                if (_isPhysicalEcuConnected.value && lastPhysicalEcuResponseTimestamp > 0L) {
+                    val silenceMs = System.currentTimeMillis() - lastPhysicalEcuResponseTimestamp
+                    if (silenceMs > 5000L) {
+                        logTerminal("WATCHDOG TIMEOUT (5s): Central permaneceu ${silenceMs / 1000}s sem responder. Declarando desconexão física da ECU.")
+                        setPhysicalEcuConnected(false)
+                        updateScanState(
+                            ScanState.ERROR,
+                            "Timeout de 5 segundos: Central parou de responder dados. Verifique ignição e conector OBD2."
+                        )
+                    }
+                }
+
                 val timeSinceLast = System.currentTimeMillis() - lastTrafficTimestamp
                 if (timeSinceLast >= 2000 && _isConnected.value) {
                     try {
-                        sendCommand("AT", timeoutMs = 500L)
+                        val resp = sendCommand("3E", timeoutMs = 600L)
+                        if (resp.contains("ERROR") || resp.contains("?")) {
+                            sendCommand("AT", timeoutMs = 500L)
+                        }
+                        consecutiveErrors = 0
+
+                        // Verificação periódica de tensão a cada ~10s
+                        if (System.currentTimeMillis() % 10000 < 2200) {
+                            val voltRaw = sendCommand("AT RV", timeoutMs = 500L)
+                            val parsed = GmDataParsers.parseElmVoltage(voltRaw)
+                            if (parsed != null) {
+                                _batteryVoltage.value = parsed
+                                if (parsed < 10.5f) {
+                                    logTerminal("Aviso de Tensão: ${parsed}V (queda de partida/arranque detectada).")
+                                }
+                            }
+                        }
                     } catch (e: Exception) {
-                        logTerminal("Aviso: Falha no keep-alive serial.")
+                        consecutiveErrors++
+                        logTerminal("Aviso no keep-alive: ${e.message} (Falhas seguidas: $consecutiveErrors/3)")
+                        if (consecutiveErrors >= 3 && isAutoReconnectOnDropEnabled.value) {
+                            logTerminal("Conexão interrompida (queda de tensão ou reinício do ELM). Iniciando auto-reconexão silenciosa...")
+                            activeDevice?.let { dev ->
+                                launch {
+                                    connectAndHandshake(dev)
+                                }
+                            }
+                            break
+                        }
                     }
                 }
             }
@@ -281,6 +739,8 @@ class ObdConnectionEngine(
         }
         activeSocket = null
         serialQueue.updateSocket(null)
+        _isBluetoothConnected.value = false
+        _isPhysicalEcuConnected.value = false
         _isConnected.value = false
         _scanState.value = ScanState.IDLE
         _statusMessage.value = "Desconectado do adaptador."

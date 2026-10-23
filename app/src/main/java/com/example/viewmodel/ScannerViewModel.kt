@@ -38,23 +38,30 @@ import java.util.Locale
 enum class AppScreen(val title: String) {
     CONNECTION("Conexão"),
     DASHBOARD("Cockpit"),
-    AI_DIAGNOSTIC("IA Diagnóstico"),
+    SPECIAL_FUNCTIONS("Ajustes"),
+    AI_DIAGNOSTIC("IA Scan"),
     DIAGNOSTICS("DTC"),
     DATALOGGER("Datalog")
 }
 
 class ScannerViewModel(application: Application) : AndroidViewModel(application) {
 
-    val scannerManager = AutoScannerManager(viewModelScope)
+    val diagnosisViewModel = DiagnosisViewModel(application)
+    val scannerManager: AutoScannerManager get() = diagnosisViewModel.realScannerManager
+    val specialFunctionsEngine: com.example.serial.AstraSpecialFunctionsEngine get() = scannerManager.specialFunctionsEngine
+
+    val connectionStatus: StateFlow<ConnectionStatus> get() = diagnosisViewModel.connectionStatus
+    val connectionLogs: StateFlow<List<String>> get() = diagnosisViewModel.connectionLogs
+    val detectedEcuData: StateFlow<DetectedEcuData> get() = diagnosisViewModel.detectedEcuData
+    val isPhysicalEcuConnected: StateFlow<Boolean> get() = diagnosisViewModel.isPhysicalEcuConnected
+    val isBluetoothConnected: StateFlow<Boolean> get() = diagnosisViewModel.isBluetoothConnected
+    val isManualProfileConfigured: StateFlow<Boolean> get() = diagnosisViewModel.isManualProfileConfigured
 
     private val _currentScreen = MutableStateFlow(AppScreen.CONNECTION)
     val currentScreen: StateFlow<AppScreen> = _currentScreen.asStateFlow()
 
-    private val _pairedDevices = MutableStateFlow<List<BluetoothDevice>>(emptyList())
-    val pairedDevices: StateFlow<List<BluetoothDevice>> = _pairedDevices.asStateFlow()
-
-    private val _selectedDevice = MutableStateFlow<BluetoothDevice?>(null)
-    val selectedDevice: StateFlow<BluetoothDevice?> = _selectedDevice.asStateFlow()
+    val pairedDevices: StateFlow<List<BluetoothDevice>> get() = diagnosisViewModel.pairedDevices
+    val selectedDevice: StateFlow<BluetoothDevice?> get() = diagnosisViewModel.selectedDevice
 
     private val _clearDtcMessage = MutableStateFlow<String?>(null)
     val clearDtcMessage: StateFlow<String?> = _clearDtcMessage.asStateFlow()
@@ -74,6 +81,29 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     val isInjectionDetected: StateFlow<Boolean> = scannerManager.isInjectionDetected
     val sensorProfile: StateFlow<EcuSensorProfile?> = scannerManager.sensorProfile
+
+    // Estados do Assistente de Saúde da Marcha Lenta e Relatório Antes vs Depois
+    private val _beforeCalibrationSnapshots = MutableStateFlow<List<com.example.serial.SensorHealthCheck>>(emptyList())
+    private val _pendingCalibrationItem = MutableStateFlow<com.example.serial.SpecialFunctionItem?>(null)
+
+    private val _activeComparisonReport = MutableStateFlow<com.example.serial.CorrectionComparisonReport?>(null)
+    val activeComparisonReport: StateFlow<com.example.serial.CorrectionComparisonReport?> = _activeComparisonReport.asStateFlow()
+
+    fun executeCalibrationWithReport(item: com.example.serial.SpecialFunctionItem, currentRpm: Float) {
+        val isRunning = currentRpm > 550f
+        val currentSnap = com.example.serial.AstraIdleHealthChecker.evaluateAllSensors(
+            scannerManager.telemetry.value,
+            scannerManager.vehicleProfile.value,
+            isRunning
+        )
+        _beforeCalibrationSnapshots.value = currentSnap
+        _pendingCalibrationItem.value = item
+        specialFunctionsEngine.startFunction(item, currentRpm)
+    }
+
+    fun dismissComparisonReport() {
+        _activeComparisonReport.value = null
+    }
 
     // -------------------------------------------------------------
     // GESTÃO DO DATALOGGER, ARQUIVOS CSV E EXPORTAÇÃO
@@ -161,6 +191,36 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                 onNewTelemetrySample(telemetry)
             }
         }
+
+        // Observa a conclusão da execução de funções especiais para gerar relatório Antes vs Depois
+        viewModelScope.launch {
+            specialFunctionsEngine.executionState.collect { state ->
+                if (state is com.example.serial.SpecialExecutionState.Success) {
+                    val pending = _pendingCalibrationItem.value
+                    if (pending != null) {
+                        kotlinx.coroutines.delay(500)
+                        val beforeList = if (_beforeCalibrationSnapshots.value.isNotEmpty()) {
+                            _beforeCalibrationSnapshots.value
+                        } else {
+                            com.example.serial.AstraIdleHealthChecker.evaluateAllSensors(
+                                scannerManager.telemetry.value,
+                                scannerManager.vehicleProfile.value,
+                                false
+                            )
+                        }
+                        val report = com.example.serial.AstraIdleHealthChecker.buildComparisonReport(
+                            testId = pending.id,
+                            testTitle = pending.title,
+                            beforeChecks = beforeList,
+                            currentTelemetry = scannerManager.telemetry.value,
+                            profile = scannerManager.vehicleProfile.value
+                        )
+                        _activeComparisonReport.value = report
+                        _pendingCalibrationItem.value = null
+                    }
+                }
+            }
+        }
     }
 
     private fun onNewTelemetrySample(telemetry: LiveTelemetry) {
@@ -191,54 +251,39 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     @SuppressLint("MissingPermission")
     fun loadPairedDevices() {
-        try {
-            val bluetoothManager = getApplication<Application>().getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-            val adapter = bluetoothManager?.adapter ?: BluetoothAdapter.getDefaultAdapter()
-            if (adapter != null && adapter.isEnabled) {
-                val devices = adapter.bondedDevices?.toList() ?: emptyList()
-                _pairedDevices.value = devices
-                if (_selectedDevice.value == null && devices.isNotEmpty()) {
-                    val obd = devices.find {
-                        val name = (it.name ?: "").uppercase()
-                        name.contains("OBD") || name.contains("ELM") || name.contains("SCAN")
-                    }
-                    _selectedDevice.value = obd ?: devices.first()
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        diagnosisViewModel.loadPairedDevices()
     }
 
     fun selectDevice(device: BluetoothDevice) {
-        _selectedDevice.value = device
+        diagnosisViewModel.selectDevice(device)
     }
 
     fun startAutoScan() {
-        scannerManager.startAutoScan(_selectedDevice.value)
+        diagnosisViewModel.startRealConnection()
+    }
+
+    fun selectEcuProfile(profile: VehicleProfile) {
+        diagnosisViewModel.selectEcuProfile(profile)
     }
 
     fun disconnect() {
-        scannerManager.disconnect()
+        diagnosisViewModel.disconnectRealConnection()
         stopDataloggerRecording()
         telemetryService?.stopLoggingSession()
     }
 
     fun scanDtcs() {
-        viewModelScope.launch {
-            scannerManager.scanDtcs()
-        }
+        diagnosisViewModel.scanRealFaultCodes()
     }
 
     fun clearDtcs() {
-        viewModelScope.launch {
-            _isClearing.value = true
-            _clearDtcMessage.value = null
-            val result = scannerManager.clearDtcs()
-            result.onSuccess {
-                _clearDtcMessage.value = "SUCESSO: $it"
-            }.onFailure {
-                _clearDtcMessage.value = "ERRO: ${it.message}"
+        _isClearing.value = true
+        _clearDtcMessage.value = null
+        diagnosisViewModel.clearRealFaultCodes { success, msg ->
+            if (success) {
+                _clearDtcMessage.value = "SUCESSO: $msg"
+            } else {
+                _clearDtcMessage.value = "ERRO: $msg"
             }
             _isClearing.value = false
         }
@@ -403,14 +448,14 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun getCsvHeader(): String {
-        return "Timestamp_ms,Data_Hora,RPM,Alvo_Lenta_RPM,Velocidade_kmh,Carga_Motor_pct,ECT_C,IAT_C,MAP_kPa,BARO_kPa,Vacuo_bar,MAF_gs,TPS_pct,TPS1_V,TPS2_V,Pedal_pct,TI_ms,DutyCycle_pct,Passos_IAC,Avanco_deg,Retardo_Knock_deg,Knock_Cil1_deg,Knock_Cil2_deg,Knock_Cil3_deg,Knock_Cil4_deg,Lambda1_V,Lambda2_V,Fator_Lambda,Status_Malha,STFT_pct,LTFT_pct,Razao_AF,Etanol_pct,Consumo_Lh,Consumo_kmL,EVAP_pct,Tensao_ECU_V,Tensao_ELM_V\n"
+        return "Timestamp_ms,Data_Hora,RPM,Alvo_Lenta_RPM,Velocidade_kmh,Carga_Motor_pct,ECT_C,IAT_C,MAP_kPa,BARO_kPa,Vacuo_bar,MAF_gs,TPS_pct,TPS1_V,TPS2_V,Pedal_pct,TI_ms,DutyCycle_pct,Passos_IAC,Avanco_deg,Retardo_Knock_deg,Knock_Cil1_deg,Knock_Cil2_deg,Knock_Cil3_deg,Knock_Cil4_deg,Lambda1_V,Lambda2_V,Fator_Lambda,Status_Malha,STFT_pct,LTFT_pct,Razao_AF,Etanol_pct,Consumo_Lh,Consumo_kmL,EVAP_pct,Tensao_ECU_V,Tensao_ELM_V,Taxa_Hz,Latencia_ms\n"
     }
 
     private fun formatTelemetryCsvLine(t: LiveTelemetry): String {
         val dateStr = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault()).format(Date(t.timestampMs))
         return String.format(
             Locale.US,
-            "%d,%s,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.2f,%.2f,%.1f,%.2f,%.2f,%.1f,%.3f,%.1f,%d,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,\"%s\",%.1f,%.1f,%.2f,%.1f,%.2f,%.1f,%.1f,%.1f,%.1f\n",
+            "%d,%s,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.2f,%.2f,%.1f,%.2f,%.2f,%.1f,%.3f,%.1f,%d,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,\"%s\",%.1f,%.1f,%.2f,%.1f,%.2f,%.1f,%.1f,%.1f,%.1f,%.1f,%d\n",
             t.timestampMs,
             dateStr,
             t.rpm,
@@ -448,8 +493,30 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             t.instantConsumptionKmPerLiter,
             t.evapPurgePercent,
             t.ecuBatteryVoltage,
-            t.elmBatteryVoltage
+            t.elmBatteryVoltage,
+            t.sampleRateHz,
+            t.loopLatencyMs
         )
+    }
+
+    fun shareDatalogFile(context: Context, file: File) {
+        try {
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                file
+            )
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/csv"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "AstraScan Datalog - ${file.name}")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(Intent.createChooser(intent, "Compartilhar Datalog do Astra"))
+        } catch (e: Exception) {
+            _exportMessage.value = "Erro ao compartilhar datalog: ${e.message}"
+        }
     }
 
     private fun bindTelemetryService() {

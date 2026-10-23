@@ -18,10 +18,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -34,7 +36,12 @@ import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.WarningAmber
+import com.example.ui.components.EcuSelectionDialog
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -45,6 +52,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -95,8 +103,17 @@ fun ConnectionScreen(
     val pairedDevices by viewModel.pairedDevices.collectAsState()
     val selectedDevice by viewModel.selectedDevice.collectAsState()
     val sensorProfile by viewModel.sensorProfile.collectAsState()
+    val connectionLogs by viewModel.connectionLogs.collectAsState()
+    val detectedEcu by viewModel.detectedEcuData.collectAsState()
+    val connectionStatus by viewModel.connectionStatus.collectAsState()
+    val isPhysicalEcuConnected by viewModel.isPhysicalEcuConnected.collectAsState()
+    val isBluetoothConnected by viewModel.isBluetoothConnected.collectAsState()
+    val isManualProfileConfigured by viewModel.isManualProfileConfigured.collectAsState()
 
     var isAdapterExpanded by remember { mutableStateOf(false) }
+    var isLogsExpanded by remember { mutableStateOf(false) }
+    var isEcuSelectorOpen by remember { mutableStateOf(false) }
+    var showHandshakeWarningDialog by remember { mutableStateOf(false) }
 
     LazyColumn(
         modifier = Modifier
@@ -370,24 +387,30 @@ fun ConnectionScreen(
         // PASSO 2. CONEXÃO À CENTRAL (ECU)
         // =====================================================================
         item {
-            val connectionBorderColor = when (scanState) {
-                ScanState.CONNECTED -> AstraGreen
-                ScanState.ERROR -> AstraRedline
-                ScanState.IDLE -> CarbonBorder
-                else -> GmAmber
+            val isScanning = scanState != ScanState.IDLE && scanState != ScanState.CONNECTED && scanState != ScanState.ERROR
+
+            val connectionBorderColor = when {
+                isPhysicalEcuConnected -> AstraGreen
+                scanState == ScanState.ERROR -> AstraRedline
+                isBluetoothConnected -> GmAmber
+                isManualProfileConfigured -> AstraCyan
+                isScanning -> GmAmber
+                else -> CarbonBorder
             }
 
-            val connectionCardBg = when (scanState) {
-                ScanState.CONNECTED -> Brush.verticalGradient(listOf(Color(0xFF002414), CarbonCard))
-                ScanState.ERROR -> Brush.verticalGradient(listOf(Color(0xFF280909), CarbonCard))
-                ScanState.IDLE -> Brush.verticalGradient(listOf(CarbonCard, CarbonCard))
-                else -> Brush.verticalGradient(listOf(Color(0xFF2B1F05), CarbonCard))
+            val connectionCardBg = when {
+                isPhysicalEcuConnected -> Brush.verticalGradient(listOf(Color(0xFF002414), CarbonCard))
+                scanState == ScanState.ERROR -> Brush.verticalGradient(listOf(Color(0xFF280909), CarbonCard))
+                isBluetoothConnected -> Brush.verticalGradient(listOf(Color(0xFF2B1F05), CarbonCard))
+                isManualProfileConfigured -> Brush.verticalGradient(listOf(Color(0xFF0C242E), CarbonCard))
+                isScanning -> Brush.verticalGradient(listOf(Color(0xFF2B1F05), CarbonCard))
+                else -> Brush.verticalGradient(listOf(CarbonCard, CarbonCard))
             }
 
             Card(
                 shape = RoundedCornerShape(14.dp),
                 colors = CardDefaults.cardColors(containerColor = CarbonCard),
-                border = BorderStroke(if (scanState == ScanState.CONNECTED || scanState != ScanState.IDLE && scanState != ScanState.ERROR) 2.dp else 1.dp, connectionBorderColor),
+                border = BorderStroke(if (isPhysicalEcuConnected || isManualProfileConfigured || isScanning) 2.dp else 1.dp, connectionBorderColor),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Box(
@@ -406,19 +429,25 @@ fun ConnectionScreen(
                                 verticalAlignment = Alignment.CenterVertically,
                                 modifier = Modifier.weight(1f).padding(end = 8.dp)
                             ) {
+                                val circleColor = when {
+                                    isPhysicalEcuConnected -> AstraGreen
+                                    isManualProfileConfigured -> AstraCyan
+                                    isBluetoothConnected -> GmAmber
+                                    else -> GmAmber
+                                }
                                 Box(
                                     modifier = Modifier
                                         .size(24.dp)
                                         .clip(CircleShape)
-                                        .background(if (scanState == ScanState.CONNECTED) AstraGreen.copy(alpha = 0.2f) else GmAmber.copy(alpha = 0.2f))
-                                        .border(1.5.dp, if (scanState == ScanState.CONNECTED) AstraGreen else GmAmber, CircleShape),
+                                        .background(circleColor.copy(alpha = 0.2f))
+                                        .border(1.5.dp, circleColor, CircleShape),
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Text(
                                         text = "2",
                                         fontSize = 12.sp,
                                         fontWeight = FontWeight.Bold,
-                                        color = if (scanState == ScanState.CONNECTED) AstraGreen else GmAmber
+                                        color = circleColor
                                     )
                                 }
                                 Spacer(modifier = Modifier.width(8.dp))
@@ -432,44 +461,57 @@ fun ConnectionScreen(
                                 )
                             }
 
+                            val badgeStyle = when {
+                                isPhysicalEcuConnected -> ConnectionBadgeStyle(
+                                    AstraGreen.copy(alpha = 0.25f),
+                                    AstraGreen.copy(alpha = 0.6f),
+                                    "● CONECTADO À ECU",
+                                    AstraGreen
+                                )
+                                scanState == ScanState.ERROR -> ConnectionBadgeStyle(
+                                    AstraRedline.copy(alpha = 0.25f),
+                                    AstraRedline.copy(alpha = 0.6f),
+                                    "FALHA",
+                                    AstraRedline
+                                )
+                                isBluetoothConnected -> ConnectionBadgeStyle(
+                                    GmAmber.copy(alpha = 0.25f),
+                                    GmAmber.copy(alpha = 0.6f),
+                                    "● ADAPTADOR (IGN OFF)",
+                                    GmAmber
+                                )
+                                isManualProfileConfigured -> ConnectionBadgeStyle(
+                                    AstraCyan.copy(alpha = 0.25f),
+                                    AstraCyan.copy(alpha = 0.6f),
+                                    "● PERFIL CONFIGURADO",
+                                    AstraCyan
+                                )
+                                isScanning -> ConnectionBadgeStyle(
+                                    GmAmber.copy(alpha = 0.25f),
+                                    GmAmber.copy(alpha = 0.6f),
+                                    "BUSCANDO...",
+                                    GmAmber
+                                )
+                                else -> ConnectionBadgeStyle(
+                                    CarbonElevated,
+                                    CarbonBorder,
+                                    "DESCONECTADO",
+                                    TextMuted
+                                )
+                            }
+
                             Box(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(8.dp))
-                                    .background(
-                                        when (scanState) {
-                                            ScanState.CONNECTED -> AstraGreen.copy(alpha = 0.25f)
-                                            ScanState.ERROR -> AstraRedline.copy(alpha = 0.25f)
-                                            ScanState.IDLE -> CarbonElevated
-                                            else -> GmAmber.copy(alpha = 0.25f)
-                                        }
-                                    )
-                                    .border(
-                                        1.dp,
-                                        when (scanState) {
-                                            ScanState.CONNECTED -> AstraGreen.copy(alpha = 0.6f)
-                                            ScanState.ERROR -> AstraRedline.copy(alpha = 0.6f)
-                                            ScanState.IDLE -> CarbonBorder
-                                            else -> GmAmber.copy(alpha = 0.6f)
-                                        },
-                                        RoundedCornerShape(8.dp)
-                                    )
+                                    .background(badgeStyle.bg)
+                                    .border(1.dp, badgeStyle.border, RoundedCornerShape(8.dp))
                                     .padding(horizontal = 10.dp, vertical = 5.dp)
                             ) {
                                 Text(
-                                    text = when (scanState) {
-                                        ScanState.CONNECTED -> "● CONECTADO"
-                                        ScanState.ERROR -> "FALHA"
-                                        ScanState.IDLE -> "DESCONECTADO"
-                                        else -> "BUSCANDO..."
-                                    },
+                                    text = badgeStyle.text,
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Bold,
-                                    color = when (scanState) {
-                                        ScanState.CONNECTED -> AstraGreen
-                                        ScanState.ERROR -> AstraRedline
-                                        ScanState.IDLE -> TextMuted
-                                        else -> GmAmber
-                                    },
+                                    color = badgeStyle.textColor,
                                     maxLines = 1,
                                     softWrap = false
                                 )
@@ -487,7 +529,7 @@ fun ConnectionScreen(
 
                         Spacer(modifier = Modifier.height(12.dp))
 
-                        if (scanState != ScanState.IDLE && scanState != ScanState.CONNECTED && scanState != ScanState.ERROR) {
+                        if (isScanning) {
                             LinearProgressIndicator(
                                 progress = { scanState.progress },
                                 modifier = Modifier
@@ -501,22 +543,41 @@ fun ConnectionScreen(
                         }
 
                         // Ações de Conectar / Desconectar
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            if (scanState == ScanState.CONNECTED) {
+                        if (isPhysicalEcuConnected) {
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
                                 Button(
                                     onClick = onNavigateToDashboard,
                                     colors = ButtonDefaults.buttonColors(containerColor = AstraGreen, contentColor = Color.Black),
                                     modifier = Modifier
-                                        .weight(1f)
-                                        .height(48.dp)
-                                        .testTag("open_dashboard_button")
+                                        .fillMaxWidth()
+                                        .height(52.dp)
+                                        .testTag("open_dashboard_button"),
+                                    shape = RoundedCornerShape(10.dp)
                                 ) {
-                                    Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text("ABRIR COCKPIT", fontWeight = FontWeight.Bold)
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.Center
+                                    ) {
+                                        Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(20.dp))
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Column(horizontalAlignment = Alignment.Start) {
+                                            Text(
+                                                text = "ABRIR COCKPIT",
+                                                fontSize = 14.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = Color.Black
+                                            )
+                                            Text(
+                                                text = "ECU Real Conectada • Telemetria Ao Vivo",
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Medium,
+                                                color = Color.Black.copy(alpha = 0.85f)
+                                            )
+                                        }
+                                    }
                                 }
 
                                 OutlinedButton(
@@ -524,15 +585,144 @@ fun ConnectionScreen(
                                     colors = ButtonDefaults.outlinedButtonColors(contentColor = AstraRedline),
                                     border = BorderStroke(1.dp, AstraRedline),
                                     modifier = Modifier
-                                        .height(48.dp)
-                                        .testTag("disconnect_button")
+                                        .fillMaxWidth()
+                                        .height(42.dp)
+                                        .testTag("disconnect_button"),
+                                    shape = RoundedCornerShape(10.dp)
                                 ) {
-                                    Icon(Icons.Default.Stop, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Icon(Icons.Default.Stop, contentDescription = null, modifier = Modifier.size(16.dp))
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text("Desconectar")
+                                    Text("Desconectar da Central", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                                 }
-                            } else {
-                                val isScanning = scanState != ScanState.IDLE && scanState != ScanState.ERROR
+                            }
+                        } else if (isManualProfileConfigured) {
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Button(
+                                    onClick = { viewModel.startAutoScan() },
+                                    enabled = !isScanning,
+                                    colors = ButtonDefaults.buttonColors(containerColor = GmAmber, contentColor = Color.Black),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(50.dp)
+                                        .testTag("start_scan_button"),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    if (isScanning) {
+                                        CircularProgressIndicator(
+                                            color = Color.Black,
+                                            strokeWidth = 2.dp,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = "Buscando Central Real no Carro...",
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 13.sp,
+                                            maxLines = 1
+                                        )
+                                    } else {
+                                        Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = "CONECTAR À CENTRAL REAL (AUTO)",
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 13.sp,
+                                            maxLines = 1
+                                        )
+                                    }
+                                }
+
+                                Button(
+                                    onClick = {
+                                        if (isPhysicalEcuConnected) {
+                                            onNavigateToDashboard()
+                                        } else {
+                                            showHandshakeWarningDialog = true
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (isPhysicalEcuConnected) AstraGreen.copy(alpha = 0.2f) else AstraCyan.copy(alpha = 0.15f),
+                                        contentColor = if (isPhysicalEcuConnected) AstraGreen else AstraCyan
+                                    ),
+                                    border = BorderStroke(1.dp, if (isPhysicalEcuConnected) AstraGreen else AstraCyan),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(52.dp)
+                                        .testTag("open_dashboard_button"),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.Center
+                                    ) {
+                                        Icon(
+                                            if (isPhysicalEcuConnected) Icons.Default.CheckCircle else Icons.Default.PlayArrow,
+                                            contentDescription = null,
+                                            tint = if (isPhysicalEcuConnected) AstraGreen else AstraCyan,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Column(horizontalAlignment = Alignment.Start) {
+                                            Text(
+                                                text = if (isPhysicalEcuConnected) "ABRIR COCKPIT AO VIVO (ECU VALIDADA)" else "ABRIR COCKPIT (AGUARDANDO HANDSHAKE)",
+                                                fontSize = 13.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = if (isPhysicalEcuConnected) AstraGreen else AstraCyan
+                                            )
+                                            Text(
+                                                text = if (isPhysicalEcuConnected) "Handshake físico concluído • Dados reais da injeção" else "Toque para validar conexão ou inspecionar",
+                                                fontSize = 10.sp,
+                                                color = if (isPhysicalEcuConnected) AstraGreen.copy(alpha = 0.85f) else AstraCyan.copy(alpha = 0.85f)
+                                            )
+                                        }
+                                    }
+                                }
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    OutlinedButton(
+                                        onClick = { isEcuSelectorOpen = true },
+                                        colors = ButtonDefaults.outlinedButtonColors(contentColor = TextSecondary),
+                                        border = BorderStroke(1.dp, CarbonBorder),
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .height(42.dp)
+                                            .testTag("manual_connection_button"),
+                                        shape = RoundedCornerShape(8.dp)
+                                    ) {
+                                        Icon(Icons.Default.Tune, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text("Trocar Central", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                    }
+
+                                    if (isBluetoothConnected) {
+                                        OutlinedButton(
+                                            onClick = { viewModel.disconnect() },
+                                            colors = ButtonDefaults.outlinedButtonColors(contentColor = AstraRedline),
+                                            border = BorderStroke(1.dp, AstraRedline.copy(alpha = 0.5f)),
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .height(42.dp)
+                                                .testTag("disconnect_button"),
+                                            shape = RoundedCornerShape(8.dp)
+                                        ) {
+                                            Icon(Icons.Default.Stop, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text("Desconectar", fontSize = 12.sp)
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
                                 Button(
                                     onClick = { viewModel.startAutoScan() },
                                     enabled = !isScanning,
@@ -559,12 +749,32 @@ fun ConnectionScreen(
                                         Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
                                         Spacer(modifier = Modifier.width(8.dp))
                                         Text(
-                                            text = "BUSCAR CENTRAL",
+                                            text = "BUSCAR CENTRAL (AUTO)",
                                             fontWeight = FontWeight.Bold,
-                                            fontSize = 14.sp,
+                                            fontSize = 13.sp,
                                             maxLines = 1
                                         )
                                     }
+                                }
+
+                                OutlinedButton(
+                                    onClick = { isEcuSelectorOpen = true },
+                                    enabled = !isScanning,
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = AstraCyan),
+                                    border = BorderStroke(1.dp, AstraCyan.copy(alpha = 0.7f)),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(46.dp)
+                                        .testTag("manual_connection_button")
+                                ) {
+                                    Icon(Icons.Default.Tune, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = "SELECIONAR CENTRAL MANUALMENTE",
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 12.sp,
+                                        maxLines = 1
+                                    )
                                 }
                             }
                         }
@@ -577,10 +787,17 @@ fun ConnectionScreen(
         // PASSO 3. CONFIGURAÇÃO DE INJEÇÃO
         // =====================================================================
         item {
+            val step3BorderColor = when {
+                isPhysicalEcuConnected -> AstraGreen.copy(alpha = 0.6f)
+                isManualProfileConfigured -> AstraCyan.copy(alpha = 0.6f)
+                isInjectionDetected -> AstraGreen.copy(alpha = 0.6f)
+                else -> CarbonBorder
+            }
+
             Card(
                 shape = RoundedCornerShape(14.dp),
                 colors = CardDefaults.cardColors(containerColor = CarbonCard),
-                border = BorderStroke(1.5.dp, if (isInjectionDetected) AstraGreen.copy(alpha = 0.6f) else CarbonBorder),
+                border = BorderStroke(1.5.dp, step3BorderColor),
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
@@ -595,19 +812,26 @@ fun ConnectionScreen(
                                 .padding(end = 8.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
+                            val step3Color = when {
+                                isPhysicalEcuConnected -> AstraGreen
+                                isManualProfileConfigured -> AstraCyan
+                                isInjectionDetected -> AstraGreen
+                                else -> TextMuted
+                            }
+
                             Box(
                                 modifier = Modifier
                                     .size(24.dp)
                                     .clip(CircleShape)
-                                    .background(if (isInjectionDetected) AstraGreen.copy(alpha = 0.2f) else CarbonElevated)
-                                    .border(1.5.dp, if (isInjectionDetected) AstraGreen else CarbonBorder, CircleShape),
+                                    .background(step3Color.copy(alpha = 0.2f))
+                                    .border(1.5.dp, step3Color, CircleShape),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
                                     text = "3",
                                     fontSize = 12.sp,
                                     fontWeight = FontWeight.Bold,
-                                    color = if (isInjectionDetected) AstraGreen else TextMuted
+                                    color = step3Color
                                 )
                             }
                             Spacer(modifier = Modifier.width(8.dp))
@@ -615,23 +839,46 @@ fun ConnectionScreen(
                                 text = "3. CONFIGURAÇÃO DE INJEÇÃO",
                                 fontSize = 13.sp,
                                 fontWeight = FontWeight.Bold,
-                                color = if (isInjectionDetected) AstraGreen else TextPrimary,
+                                color = if (isPhysicalEcuConnected || isManualProfileConfigured || isInjectionDetected) TextPrimary else TextSecondary,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
+                            )
+                        }
+
+                        val (step3BadgeBg, step3BadgeText, step3BadgeColor) = when {
+                            isPhysicalEcuConnected -> Triple(
+                                AstraGreen.copy(alpha = 0.15f),
+                                "DETECTADA NA LINHA K",
+                                AstraGreen
+                            )
+                            isManualProfileConfigured -> Triple(
+                                AstraCyan.copy(alpha = 0.15f),
+                                "CONFIGURADA MANUALMENTE",
+                                AstraCyan
+                            )
+                            isInjectionDetected -> Triple(
+                                AstraGreen.copy(alpha = 0.15f),
+                                "DETECTADA",
+                                AstraGreen
+                            )
+                            else -> Triple(
+                                CarbonElevated,
+                                "AGUARDANDO",
+                                TextMuted
                             )
                         }
 
                         Box(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(6.dp))
-                                .background(if (isInjectionDetected) AstraGreen.copy(alpha = 0.15f) else CarbonElevated)
+                                .background(step3BadgeBg)
                                 .padding(horizontal = 8.dp, vertical = 3.dp)
                         ) {
                             Text(
-                                text = if (isInjectionDetected) "DETECTADA" else "AGUARDANDO",
+                                text = step3BadgeText,
                                 fontSize = 10.sp,
                                 fontWeight = FontWeight.Bold,
-                                color = if (isInjectionDetected) AstraGreen else TextMuted,
+                                color = step3BadgeColor,
                                 maxLines = 1,
                                 softWrap = false
                             )
@@ -841,9 +1088,222 @@ fun ConnectionScreen(
                             ProfileDetailRow("CalID:", "--")
                         }
                     }
+
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    OutlinedButton(
+                        onClick = { isEcuSelectorOpen = true },
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = GmAmber),
+                        border = BorderStroke(1.dp, GmAmber.copy(alpha = 0.7f)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(46.dp)
+                            .testTag("select_ecu_manually_button")
+                    ) {
+                        Icon(Icons.Default.Tune, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = if (isInjectionDetected) "ALTERAR CENTRAL / SELECIONAR MANUALMENTE" else "SELECIONAR CENTRAL MANUALMENTE",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+
+            if (isEcuSelectorOpen) {
+                EcuSelectionDialog(
+                    currentProfile = vehicle,
+                    onSelectProfile = { selected ->
+                        viewModel.selectEcuProfile(selected)
+                        isEcuSelectorOpen = false
+                    },
+                    onDismiss = { isEcuSelectorOpen = false }
+                )
+            }
+        }
+
+
+        // =====================================================================
+        // LOGS DE TENTATIVA DE CONEXÃO E COMUNICAÇÃO OBD2 EM TEMPO REAL
+        // =====================================================================
+        item {
+            Card(
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = CarbonCard),
+                border = BorderStroke(1.dp, CarbonBorder),
+                modifier = Modifier.fillMaxWidth().testTag("connection_logs_card")
+            ) {
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable { isLogsExpanded = !isLogsExpanded }
+                            .padding(vertical = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text(
+                                text = "LOGS DA CONEXÃO OBD2",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = TextPrimary
+                            )
+                            Text(
+                                text = "${connectionLogs.size} eventos • Status: ${connectionStatus.label}",
+                                fontSize = 11.sp,
+                                color = GmAmberLight,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+
+                        Icon(
+                            imageVector = if (isLogsExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                            contentDescription = if (isLogsExpanded) "Recolher" else "Expandir",
+                            tint = TextMuted,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+
+                    if (isLogsExpanded) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 240.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(Color(0xFF0C0C0E))
+                                .border(1.dp, CarbonBorder, RoundedCornerShape(8.dp))
+                                .padding(10.dp)
+                        ) {
+                            if (connectionLogs.isEmpty()) {
+                                Text(
+                                    text = "Nenhum tráfego serial registrado ainda. Inicie a conexão para visualizar o handshake físico e respostas da central.",
+                                    fontSize = 11.sp,
+                                    color = TextMuted
+                                )
+                            } else {
+                                LazyColumn(
+                                    verticalArrangement = Arrangement.spacedBy(3.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    items(connectionLogs.takeLast(50)) { logEntry ->
+                                        Text(
+                                            text = logEntry,
+                                            fontSize = 10.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            color = when {
+                                                logEntry.contains("ERRO", ignoreCase = true) -> AstraRedline
+                                                logEntry.contains("SUCESSO", ignoreCase = true) || logEntry.contains("DETECTADA", ignoreCase = true) -> AstraGreen
+                                                logEntry.contains("TX", ignoreCase = true) -> AstraCyan
+                                                logEntry.contains("RX", ignoreCase = true) -> GmAmberLight
+                                                else -> TextSecondary
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (detectedEcu.isDetected) {
+                                Text(
+                                    text = "ECU: ${detectedEcu.ecuName}",
+                                    fontSize = 10.sp,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = AstraGreen,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f).padding(end = 6.dp)
+                                )
+                            } else {
+                                Spacer(modifier = Modifier.width(1.dp))
+                            }
+
+                            TextButton(
+                                onClick = { viewModel.diagnosisViewModel.clearLogs() }
+                            ) {
+                                Text("LIMPAR LOGS", fontSize = 11.sp, color = TextMuted)
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
+
+    if (showHandshakeWarningDialog) {
+        AlertDialog(
+            onDismissRequest = { showHandshakeWarningDialog = false },
+            containerColor = CarbonCard,
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.Security,
+                        contentDescription = null,
+                        tint = GmAmber,
+                        modifier = Modifier.size(22.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Validação de Handshake",
+                        color = TextPrimary,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        text = "A central eletrônica (ECU) ainda não validou a troca de dados físicos via cabo/Bluetooth.",
+                        color = TextPrimary,
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp
+                    )
+                    Text(
+                        text = "Para visualizar instrumentos com dados 100% reais em tempo real, conecte o scanner no Astra e ligue a ignição do carro.",
+                        color = TextSecondary,
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showHandshakeWarningDialog = false
+                        viewModel.startAutoScan()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = GmAmber, contentColor = Color.Black)
+                ) {
+                    Text("CONECTAR AGORA", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                }
+            },
+            dismissButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    TextButton(onClick = { showHandshakeWarningDialog = false }) {
+                        Text("CANCELAR", color = TextMuted, fontSize = 11.sp)
+                    }
+                    TextButton(
+                        onClick = {
+                            showHandshakeWarningDialog = false
+                            onNavigateToDashboard()
+                        }
+                    ) {
+                        Text("ABRIR OFFLINE", color = AstraCyan, fontSize = 11.sp)
+                    }
+                }
+            }
+        )
     }
 }
 
@@ -862,3 +1322,10 @@ private fun ProfileDetailRow(label: String, value: String) {
         )
     }
 }
+
+private data class ConnectionBadgeStyle(
+    val bg: Color,
+    val border: Color,
+    val text: String,
+    val textColor: Color
+)

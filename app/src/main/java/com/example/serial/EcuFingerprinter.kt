@@ -24,7 +24,11 @@ class EcuFingerprinter(
 
     private fun log(msg: String) {
         logCallback("[FINGERPRINTER] $msg")
-        Log.d(TAG, msg)
+        try {
+            Log.d(TAG, msg)
+        } catch (_: Throwable) {
+            // Ignora falha de mock em testes unitários JVM
+        }
     }
 
     /**
@@ -33,47 +37,7 @@ class EcuFingerprinter(
     suspend fun interrogateAndFingerprint(): Pair<VehicleProfile, EcuSensorProfile> {
         log("Iniciando rotina de leitura de descritores de hardware e software...")
 
-        // 1. Part Number GM (Modo KWP 1A 90 ou SAE OBD-II)
-        val partNumberRaw = try {
-            commandSender("1A 90", 1500L)
-        } catch (e: Exception) {
-            ""
-        }
-        log("< 1A 90 (Part Number GM): $partNumberRaw")
-
-        // 2. Hardware Number / Fornecedor (1A 91)
-        val hwNumberRaw = try {
-            commandSender("1A 91", 1500L)
-        } catch (e: Exception) {
-            ""
-        }
-        log("< 1A 91 (Hardware Number): $hwNumberRaw")
-
-        // 3. Software Version / Calibração da ECU (1A 92)
-        val swVerRaw = try {
-            commandSender("1A 92", 1500L)
-        } catch (e: Exception) {
-            ""
-        }
-        log("< 1A 92 (Software Version): $swVerRaw")
-
-        // 4. Identificador de Fornecedor / Diagnóstico GM (1A 97 / 1A 80)
-        val supplierRaw = try {
-            commandSender("1A 97", 1200L)
-        } catch (e: Exception) {
-            ""
-        }
-        log("< 1A 97 (Supplier/Diag ID): $supplierRaw")
-
-        // 5. Número de Chassi / VIN (09 02 ou 1A 90)
-        val vinRaw = try {
-            commandSender("09 02", 1500L)
-        } catch (e: Exception) {
-            ""
-        }
-        log("< 09 02 (VIN / Chassi): $vinRaw")
-
-        // 6. Calibration ID / Versão de Calibração (09 04 ou 1A 94)
+        // 1. Calibration ID / Versão de Calibração (09 04 ou 1A 94)
         val calIdRaw = try {
             commandSender("09 04", 1500L)
         } catch (e: Exception) {
@@ -81,26 +45,138 @@ class EcuFingerprinter(
         }
         log("< 09 04 (CalID): $calIdRaw")
 
+        // 2. Nome de Broadcast da ECU / Descriptor (09 0A)
+        val ecuNameRaw = try {
+            commandSender("09 0A", 1200L)
+        } catch (e: Exception) {
+            ""
+        }
+        log("< 09 0A (ECU Name): $ecuNameRaw")
+
+        // 3. Part Number GM (Modo KWP 1A 90 ou SAE OBD-II)
+        val partNumberRaw = try {
+            commandSender("1A 90", 1500L)
+        } catch (e: Exception) {
+            ""
+        }
+        log("< 1A 90 (Part Number GM): $partNumberRaw")
+
+        // 4. Número de Chassi / VIN (09 02 ou 1A 90)
+        val vinRaw = try {
+            commandSender("09 02", 1500L)
+        } catch (e: Exception) {
+            ""
+        }
+        log("< 09 02 (VIN / Chassi): $vinRaw")
+
+        // 5. Hardware Number / Fornecedor (1A 91)
+        val hwNumberRaw = try {
+            commandSender("1A 91", 1200L)
+        } catch (e: Exception) {
+            ""
+        }
+        log("< 1A 91 (Hardware Number): $hwNumberRaw")
+
+        // 6. Software Version / Calibração da ECU (1A 92)
+        val swVerRaw = try {
+            commandSender("1A 92", 1200L)
+        } catch (e: Exception) {
+            ""
+        }
+        log("< 1A 92 (Software Version): $swVerRaw")
+
+        // 7. Identificador GM de Diagnóstico (1A 80 / 1A 97)
+        val diagIdRaw = try {
+            commandSender("1A 80", 1000L)
+        } catch (e: Exception) {
+            ""
+        }
+        log("< 1A 80 (GM Diag ID): $diagIdRaw")
+
+        // 8. Identificador Multec GM (21 80)
+        val multecIdRaw = try {
+            commandSender("21 80", 1000L)
+        } catch (e: Exception) {
+            ""
+        }
+        log("< 21 80 (Multec ID): $multecIdRaw")
+
+        // =========================================================================
+        // SONDAS FÍSICAS DE HARDWARE (PROBES PARA DESAMBIGUAÇÃO DBW VS CABO + IAC)
+        // =========================================================================
+        // Probe 1: Atuador de Marcha Lenta Mecânica IAC (21 19)
+        val iacProbeRaw = try {
+            commandSender("21 19", 600L)
+        } catch (e: Exception) {
+            ""
+        }
+        val hasIacConfirmed = iacProbeRaw.contains("61 19") && !GmDataParsers.isNegativeResponse(iacProbeRaw)
+        if (hasIacConfirmed) {
+            log("Sonda física: Atuador de Marcha Lenta IAC (Motor de Passo) CONFIRMADO na linha K.")
+        }
+
+        // Probe 2: Borboleta Eletrônica Drive-By-Wire / Pedal APP (01 49 ou 21 13)
+        val dbwProbeRaw = try {
+            commandSender("01 49", 600L)
+        } catch (e: Exception) {
+            ""
+        }
+        val dbw2ProbeRaw = if (!dbwProbeRaw.contains("41 49")) {
+            try { commandSender("21 13", 600L) } catch (_: Exception) { "" }
+        } else ""
+        val hasDbwConfirmed = (dbwProbeRaw.contains("41 49") && !GmDataParsers.isNegativeResponse(dbwProbeRaw)) ||
+                (dbw2ProbeRaw.contains("61 13") && !GmDataParsers.isNegativeResponse(dbw2ProbeRaw))
+        if (hasDbwConfirmed) {
+            log("Sonda física: Borboleta Eletrônica Drive-by-Wire (DBW) CONFIRMADA na linha K.")
+        }
+
+        // Probe 3: Transmissão Automática Aisin (Target 0x18 na Linha K)
+        var hasAtConfirmed = false
+        try {
+            val atShResp = commandSender("AT SH 81 18 F1", 400L)
+            if (!atShResp.contains("ERROR")) {
+                val atProbe = commandSender("1A 90", 600L)
+                if (atProbe.contains("5A 90") || (atProbe.isNotBlank() && !GmDataParsers.isNegativeResponse(atProbe))) {
+                    hasAtConfirmed = true
+                    log("Sonda física: Câmbio Automático Aisin 50-40LE detectado no barramento K-Line.")
+                }
+                // Restaura o cabeçalho original da injeção primária GM
+                commandSender("AT SH 81 11 F1", 400L)
+            }
+        } catch (_: Exception) {
+            try { commandSender("AT SH 81 11 F1", 400L) } catch (_: Exception) {}
+        }
+
         // Decodificação e sanitização rigorosa contra NRCs
         val partNumber = GmDataParsers.parsePartNumber(partNumberRaw)
         val hwNumber = GmDataParsers.cleanResponse(hwNumberRaw)
         val swVer = GmDataParsers.cleanResponse(swVerRaw)
         val calId = GmDataParsers.parseCalId(calIdRaw)
+        val ecuNameBroadcast = GmDataParsers.parseEcuName(ecuNameRaw)
         val vin = GmDataParsers.parseVin(vinRaw)
+        val decodedVin = GmDataParsers.decodeVin(vin)
+        if (decodedVin.isValid) {
+            log("VIN Decodificado: $vin | Ano: ${decodedVin.modelYear} | Planta: ${decodedVin.assemblyPlant} | ${decodedVin.manufacturer}")
+        }
 
-        log("Identificadores processados: PN='$partNumber', HW='$hwNumber', SW='$swVer', CalID='$calId', VIN='$vin'")
+        log("Identificadores processados: PN='$partNumber', HW='$hwNumber', SW='$swVer', CalID='$calId', EcuName='$ecuNameBroadcast', VIN='$vin', IAC=$hasIacConfirmed, DBW=$hasDbwConfirmed, AT=$hasAtConfirmed")
 
         // Pareamento com a base de Fingerprints GM Brasil
-        val matchedProfile = GmDataParsers.matchVehicleProfile(
+        val rawMatchedProfile = GmDataParsers.matchVehicleProfile(
             partNumber = partNumber,
             hardwareNumber = hwNumber,
-            softwareVersion = swVer,
+            softwareVersion = "$swVer $diagIdRaw $multecIdRaw",
             calId = calId,
             vin = vin,
+            ecuNameBroadcast = ecuNameBroadcast,
+            hasIacConfirmed = hasIacConfirmed,
+            hasDbwConfirmed = hasDbwConfirmed,
             fallbackProfile = VehicleProfile.UNKNOWN
         )
 
-        log("Central Mapeada: ${matchedProfile.ecuName} | Motor: ${matchedProfile.engineCode}")
+        val matchedProfile = rawMatchedProfile.copy(hasAutomaticTransmission = hasAtConfirmed)
+
+        log("Central Mapeada: ${matchedProfile.ecuName} | Motor: ${matchedProfile.engineCode} | Câmbio: ${if (hasAtConfirmed) "Automático Aisin" else "Manual F17/F23"}")
 
         // Geração da matriz de sensores e parâmetros compatíveis
         val sensorProfile = mapSensorCapabilities(matchedProfile)
@@ -122,9 +198,12 @@ class EcuFingerprinter(
         val is16vDohc = profile.valveCount.contains("16") || engineUpper.contains("C20SEL") || engineUpper.contains("X20XEV")
         val isBelga = ecuUpper.contains("M1.5.2") || ecuUpper.contains("BELGA") || ecuUpper.contains("SIMTEC")
 
-        // Acelerador: Se for Delphi Multec H Fase 2 ou Motronic ME7.9.6 possui Drive-by-Wire (sem motor de passo IAC a cabo)
-        val hasDriveByWire = isMultecHFlex && (profile.years.contains("2009") || profile.years.contains("2011") || profile.calId.contains("F2"))
-        val hasMechanicalIac = !hasDriveByWire // M1.5.5 e Multec Fase 1 usam atuador IAC de 4 passos
+        // Acelerador: Se for Delphi Multec H (Fase 1 ou 2) ou Bosch ME 7.9.6 / ME 7.9.9 possui Drive-by-Wire (sem motor de passo IAC a cabo)
+        val isBoschME = ecuUpper.contains("ME 7") || ecuUpper.contains("ME7")
+        val isMultecDbw = (ecuUpper.contains("MT27E") || ecuUpper.contains("MULTEC H") || profile.supportsFlexPids) &&
+                !ecuUpper.contains("EMS") && !ecuUpper.contains("MULTEC F") && !ecuUpper.contains("MULTEC M")
+        val hasDriveByWire = isBoschME || isMultecDbw
+        val hasMechanicalIac = !hasDriveByWire // M1.5.5, M1.5.2, Multec EMS 1.8 e Multec M usam atuador IAC de 4 passos
         val hasFlexPids = profile.supportsFlexPids || isMultecHFlex
         val hasIndividualKnock = isMotronicM155 || is16vDohc // Motronic M1.5.5 possui duplo sensor de detonação com retardo por cilindro
         val hasPostCatLambda = profile.supportsFlexPids || profile.years.contains("2005") || profile.years.contains("2009")

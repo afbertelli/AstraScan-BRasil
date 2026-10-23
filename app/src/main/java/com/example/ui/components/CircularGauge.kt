@@ -64,8 +64,10 @@ fun CircularGauge(
     redlineStart: Float? = null,
     formatString: String = "%.0f"
 ) {
-    val clampedValue = value.coerceIn(minValue, maxValue)
-    val fraction = ((clampedValue - minValue) / (maxValue - minValue)).coerceIn(0f, 1f)
+    val safeMin = if (minValue.isNaN()) 0f else minValue
+    val safeMax = if (maxValue.isNaN() || maxValue <= safeMin) safeMin + 1f else maxValue
+    val safeValue = if (value.isNaN()) safeMin else value.coerceIn(safeMin, safeMax)
+    val fraction = ((safeValue - safeMin) / (safeMax - safeMin)).coerceIn(0f, 1f)
 
     val animatedFraction by animateFloatAsState(
         targetValue = fraction,
@@ -108,8 +110,8 @@ fun CircularGauge(
                 )
 
                 // 2. Arco de Faixa Vermelha (Redline) se definido
-                if (redlineStart != null && redlineStart < maxValue) {
-                    val redlineFraction = ((redlineStart - minValue) / (maxValue - minValue)).coerceIn(0f, 1f)
+                if (redlineStart != null && !redlineStart.isNaN() && redlineStart < safeMax && redlineStart >= safeMin) {
+                    val redlineFraction = ((redlineStart - safeMin) / (safeMax - safeMin)).coerceIn(0f, 1f)
                     val redlineStartAngle = startAngle + (sweepAngle * redlineFraction)
                     val redlineSweep = sweepAngle * (1f - redlineFraction)
 
@@ -126,7 +128,7 @@ fun CircularGauge(
 
                 // 3. Arco Ativo do Valor Atual
                 val activeSweep = sweepAngle * animatedFraction
-                val isOverRedline = redlineStart != null && clampedValue >= redlineStart
+                val isOverRedline = redlineStart != null && safeValue >= redlineStart
                 val activeColor = if (isOverRedline) AstraRedline else primaryColor
 
                 drawArc(
@@ -220,7 +222,7 @@ fun CircularGauge(
                     horizontalArrangement = Arrangement.Center
                 ) {
                     Text(
-                        text = formatString.format(clampedValue),
+                        text = formatString.format(safeValue),
                         fontSize = 17.sp,
                         fontWeight = FontWeight.Bold,
                         fontFamily = FontFamily.Monospace,

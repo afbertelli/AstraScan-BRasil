@@ -1,9 +1,12 @@
 package com.example.ui.screens
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import com.example.ui.components.EcuSelectionDialog
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -19,12 +22,20 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ListAlt
 import androidx.compose.material.icons.filled.ElectricBolt
-import androidx.compose.material.icons.filled.ListAlt
 import androidx.compose.material.icons.filled.LocalGasStation
 import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material.icons.filled.Whatshot
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -32,9 +43,12 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -53,6 +67,7 @@ import com.example.model.VehicleProfile
 import com.example.ui.components.CircularGauge
 import com.example.ui.components.DigitalMetricCard
 import com.example.ui.components.LinearGauge
+import com.example.ui.components.RealtimeTelemetryChart
 import com.example.ui.theme.AstraCyan
 import com.example.ui.theme.AstraGreen
 import com.example.ui.theme.AstraRedline
@@ -125,7 +140,7 @@ enum class CockpitGroup(
         title = "Todos os Parâmetros",
         shortLabel = "Ver Todos",
         subtitle = "Visualização contínua com todos os parâmetros da ECU",
-        icon = Icons.Default.ListAlt,
+        icon = Icons.AutoMirrored.Filled.ListAlt,
         accentColor = TextPrimary,
         pidsCount = "35 PIDs"
     )
@@ -139,14 +154,55 @@ fun DashboardScreen(
     val vehicle by viewModel.scannerManager.vehicleProfile.collectAsState()
     val isInjectionDetected by viewModel.isInjectionDetected.collectAsState()
     val scanState by viewModel.scannerManager.scanState.collectAsState()
+    val statusMsg by viewModel.scannerManager.statusMessage.collectAsState()
     val isRecording by viewModel.isRecordingDatalogger.collectAsState()
     val recordedCount by viewModel.recordedDataloggerCount.collectAsState()
+    val isPhysicalEcuConnected by viewModel.isPhysicalEcuConnected.collectAsState()
+    val isBluetoothConnected by viewModel.isBluetoothConnected.collectAsState()
+    val isManualProfileConfigured by viewModel.isManualProfileConfigured.collectAsState()
 
     var selectedGroup by rememberSaveable { mutableStateOf(CockpitGroup.GERAL) }
+    var isEcuSelectorOpen by rememberSaveable { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val coroutineScope = rememberCoroutineScope()
 
-    val isConnected = scanState == ScanState.CONNECTED
+    val isConnected = isPhysicalEcuConnected
+
+    val rpmHistory = remember { mutableStateListOf<Float>() }
+    val ectHistory = remember { mutableStateListOf<Float>() }
+    val mapHistory = remember { mutableStateListOf<Float>() }
+    val lambdaHistory = remember { mutableStateListOf<Float>() }
+
+    LaunchedEffect(telemetry.timestampMs, isConnected) {
+        if (isConnected) {
+            rpmHistory.add(telemetry.rpm)
+            if (rpmHistory.size > 50) rpmHistory.removeAt(0)
+
+            ectHistory.add(telemetry.coolantTempC)
+            if (ectHistory.size > 50) ectHistory.removeAt(0)
+
+            mapHistory.add(telemetry.mapKpa)
+            if (mapHistory.size > 50) mapHistory.removeAt(0)
+
+            lambdaHistory.add(telemetry.lambdaVoltage)
+            if (lambdaHistory.size > 50) lambdaHistory.removeAt(0)
+        } else {
+            if (rpmHistory.isNotEmpty()) rpmHistory.clear()
+            if (ectHistory.isNotEmpty()) ectHistory.clear()
+            if (mapHistory.isNotEmpty()) mapHistory.clear()
+            if (lambdaHistory.isNotEmpty()) lambdaHistory.clear()
+        }
+    }
+
+    if (isEcuSelectorOpen) {
+        EcuSelectionDialog(
+            currentProfile = vehicle,
+            onSelectProfile = { selected ->
+                viewModel.selectEcuProfile(selected)
+            },
+            onDismiss = { isEcuSelectorOpen = false }
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -166,6 +222,7 @@ fun DashboardScreen(
                 .clip(RoundedCornerShape(12.dp))
                 .background(CarbonCard)
                 .border(1.dp, CarbonBorder, RoundedCornerShape(12.dp))
+                .clickable { isEcuSelectorOpen = true }
                 .padding(horizontal = 14.dp, vertical = 10.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
@@ -175,25 +232,83 @@ fun DashboardScreen(
                     .weight(1f)
                     .padding(end = 8.dp)
             ) {
-                if (isInjectionDetected && isConnected) {
+                if (isPhysicalEcuConnected) {
                     val title = if (vehicle.engineCode == "Desconhecido" || vehicle.engineCode.isBlank()) {
-                        "Astra 2.0 • Injeção GM Conectada"
+                        "Astra 2.0 • Injeção GM Ao Vivo"
                     } else {
                         "${vehicle.engineCode} • ${vehicle.valveCount}"
                     }
                     val subtitle = if (vehicle.ecuName == "ECU Não Identificada" || vehicle.ecuName.isBlank()) {
-                        "Delphi Multec / Motronic • GM Brasil"
+                        "Linha K • Conectada em Tempo Real"
                     } else {
                         "${vehicle.ecuName} • ${vehicle.horsepower}"
                     }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = title,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = AstraGreen,
+                            maxLines = 1,
+                            softWrap = false
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(AstraGreen.copy(alpha = 0.2f))
+                                .padding(horizontal = 5.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = if (telemetry.sampleRateHz > 0f) String.format(Locale.US, "AO VIVO • %.1f Hz", telemetry.sampleRateHz) else "AO VIVO",
+                                fontSize = 8.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = AstraGreen
+                            )
+                        }
+                    }
                     Text(
-                        text = title,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = GmAmber,
+                        text = subtitle,
+                        fontSize = 11.sp,
+                        color = TextMuted,
                         maxLines = 1,
                         softWrap = false
                     )
+                } else if (isManualProfileConfigured || isInjectionDetected) {
+                    val title = if (vehicle.engineCode == "Desconhecido" || vehicle.engineCode.isBlank()) {
+                        "Astra 2.0 Flexpower • Offline"
+                    } else {
+                        "${vehicle.engineCode} • Offline"
+                    }
+                    val subtitle = if (vehicle.ecuName == "ECU Não Identificada" || vehicle.ecuName.isBlank()) {
+                        "Perfil GM Selecionado (Offline)"
+                    } else {
+                        "${vehicle.ecuName} • ${vehicle.horsepower}"
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = title,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = AstraCyan,
+                            maxLines = 1,
+                            softWrap = false
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(AstraCyan.copy(alpha = 0.2f))
+                                .padding(horizontal = 5.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = "TROCAR",
+                                fontSize = 8.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = AstraCyan
+                            )
+                        }
+                    }
                     Text(
                         text = subtitle,
                         fontSize = 11.sp,
@@ -250,20 +365,125 @@ fun DashboardScreen(
                     Spacer(modifier = Modifier.width(8.dp))
                 }
 
+                val headerBadge = when {
+                    isPhysicalEcuConnected -> DashboardHeaderBadgeStyle(
+                        AstraGreen.copy(alpha = 0.2f),
+                        AstraGreen.copy(alpha = 0.6f),
+                        "● AO VIVO",
+                        AstraGreen
+                    )
+                    isBluetoothConnected -> DashboardHeaderBadgeStyle(
+                        GmAmber.copy(alpha = 0.2f),
+                        GmAmber.copy(alpha = 0.6f),
+                        "● ADAPTADOR (IGN OFF)",
+                        GmAmber
+                    )
+                    isManualProfileConfigured -> DashboardHeaderBadgeStyle(
+                        AstraCyan.copy(alpha = 0.15f),
+                        AstraCyan.copy(alpha = 0.4f),
+                        "● OFFLINE",
+                        AstraCyan
+                    )
+                    else -> DashboardHeaderBadgeStyle(
+                        CarbonElevated,
+                        CarbonBorder,
+                        "OFFLINE",
+                        TextMuted
+                    )
+                }
+
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(10.dp))
-                        .background(if (isConnected) AstraGreen.copy(alpha = 0.2f) else CarbonElevated)
+                        .background(headerBadge.bg)
+                        .border(1.dp, headerBadge.border, RoundedCornerShape(10.dp))
                         .padding(horizontal = 10.dp, vertical = 5.dp)
                 ) {
                     Text(
-                        text = if (isConnected) "AO VIVO" else "OFFLINE",
+                        text = headerBadge.text,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
-                        color = if (isConnected) AstraGreen else TextMuted,
+                        color = headerBadge.textColor,
                         maxLines = 1,
                         softWrap = false
                     )
+                }
+            }
+        }
+
+        // Aviso honesto quando não estiver conectado à ECU física do veículo
+        if (!isPhysicalEcuConnected) {
+            val isTimeoutOrError = scanState == ScanState.ERROR
+            val bannerBorderColor = if (isTimeoutOrError) AstraRedline.copy(alpha = 0.6f) else AstraCyan.copy(alpha = 0.4f)
+            val bannerBg = if (isTimeoutOrError) Color(0xFF280909) else Color(0xFF131D24)
+            val bannerTint = if (isTimeoutOrError) AstraRedline else AstraCyan
+
+            Spacer(modifier = Modifier.height(6.dp))
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(bannerBg)
+                    .border(1.dp, bannerBorderColor, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 12.dp, vertical = 7.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = if (isTimeoutOrError) Icons.Default.WarningAmber else Icons.Default.Tune,
+                        contentDescription = null,
+                        tint = bannerTint,
+                        modifier = Modifier.size(15.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = when {
+                            isTimeoutOrError -> statusMsg
+                            isBluetoothConnected -> "Adaptador Bluetooth conectado. Ligue a ignição do Astra para leitura real dos sensores."
+                            else -> "Aguardando dados da ECU física. Conecte o scanner no Astra e ligue a ignição."
+                        },
+                        fontSize = 11.sp,
+                        color = bannerTint,
+                        lineHeight = 15.sp
+                    )
+                }
+            }
+        }
+
+        // Alerta Crítico Proativo de Proteção do Motor e Alternador
+        if (isPhysicalEcuConnected) {
+            val isOverheating = telemetry.coolantTempC >= 104f
+            val isAlternatorFailing = telemetry.ecuBatteryVoltage in 1.0f..11.8f && telemetry.rpm > 550f
+
+            if (isOverheating || isAlternatorFailing) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (isOverheating) Color(0xFF380808) else Color(0xFF382305))
+                        .border(1.dp, if (isOverheating) AstraRedline else GmAmber, RoundedCornerShape(8.dp))
+                        .padding(horizontal = 12.dp, vertical = 7.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.WarningAmber,
+                            contentDescription = null,
+                            tint = if (isOverheating) AstraRedline else GmAmber,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = if (isOverheating) {
+                                "ALERTA TÉRMICO CRÍTICO: ECT em ${telemetry.coolantTempC.toInt()}°C! Verifique ventoinhas e termostática."
+                            } else {
+                                "ALERTA DE CARGA: Tensão da ECU em ${String.format(Locale.US, "%.1f", telemetry.ecuBatteryVoltage)}V com motor ligado. Possível falha no alternador."
+                            },
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isOverheating) AstraRedline else GmAmberLight,
+                            lineHeight = 15.sp
+                        )
+                    }
                 }
             }
         }
@@ -483,6 +703,20 @@ fun DashboardScreen(
                 }
 
                 item {
+                    RealtimeTelemetryChart(
+                        rpmHistory = rpmHistory,
+                        ectHistory = ectHistory,
+                        mapHistory = mapHistory,
+                        lambdaHistory = lambdaHistory,
+                        currentRpm = if (isConnected) telemetry.rpm else 0f,
+                        currentEct = if (isConnected) telemetry.coolantTempC else 0f,
+                        currentMap = if (isConnected) telemetry.mapKpa else 0f,
+                        currentLambda = if (isConnected) telemetry.lambdaVoltage else 0f,
+                        isConnected = isConnected
+                    )
+                }
+
+                item {
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         LinearGauge(
                             title = "Temperatura do Arrefecimento (ECT)",
@@ -660,6 +894,61 @@ fun DashboardScreen(
                                 subtitle = "Vazão estimada"
                             )
                         }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            val isFlex = vehicle.supportsFlexPids
+                            val afColor = if (isConnected && (telemetry.estimatedAfRatio in 8.8f..9.5f || telemetry.estimatedAfRatio in 12.8f..13.6f)) AstraGreen else AstraYellow
+                            DigitalMetricCard(
+                                title = "Razão A/F Estimada",
+                                value = if (isConnected && telemetry.estimatedAfRatio > 0f) {
+                                    String.format(Locale.US, "%.1f:1", telemetry.estimatedAfRatio)
+                                } else if (isConnected && !isFlex) {
+                                    "13.2:1"
+                                } else {
+                                    "--"
+                                },
+                                unit = "",
+                                modifier = Modifier.weight(1f),
+                                accentColor = afColor,
+                                subtitle = if (!isConnected) "Desconectado" else if (telemetry.estimatedAfRatio in 8.5f..10.5f) "Mapa Etanol" else if (telemetry.estimatedAfRatio in 12.5f..14.0f) "Mapa Gasolina" else "Em adaptação"
+                            )
+
+                            DigitalMetricCard(
+                                title = "Teor de Etanol no Tanque",
+                                value = if (isConnected && isFlex) {
+                                    "${telemetry.ethanolPercentage.toInt()}%"
+                                } else if (isConnected && !isFlex) {
+                                    "0% (Gasolina)"
+                                } else {
+                                    "--"
+                                },
+                                unit = "",
+                                modifier = Modifier.weight(1f),
+                                accentColor = if (isFlex && telemetry.ethanolPercentage > 50f) AstraCyan else GmAmberLight,
+                                subtitle = if (isFlex) "Cálculo Flexpower GM" else "Astra Monocombustível"
+                            )
+                        }
+
+                        // OSCILOSCÓPIO EM TEMPO REAL DA SONDA LAMBDA
+                        LambdaOscilloscopeCard(
+                            lambdaVoltage = telemetry.lambdaVoltage,
+                            frequencyHz = telemetry.lambdaFrequencyHz,
+                            healthStatus = telemetry.lambdaHealthStatus,
+                            history = telemetry.lambdaHistory,
+                            isConnected = isConnected
+                        )
+
+                        // MONITOR DE SAÚDE DA MISTURA & FUEL TRIMS
+                        FuelTrimHealthCard(
+                            stft = telemetry.shortTermFuelTrim,
+                            ltft = telemetry.longTermFuelTrim,
+                            healthLevel = telemetry.fuelTrimHealthLevel,
+                            healthMessage = telemetry.fuelTrimHealthMessage,
+                            isConnected = isConnected
+                        )
                     }
                 }
             }
@@ -1095,3 +1384,338 @@ private fun CockpitGroupButton(
         }
     }
 }
+
+/**
+ * Osciloscópio da Sonda Lambda pré-catalisador com desenho de forma de onda (Waveform em Canvas),
+ * linha de referência de 450 mV e indicador de frequência dinâmica de oscilação em Hertz.
+ */
+@Composable
+fun LambdaOscilloscopeCard(
+    lambdaVoltage: Float,
+    frequencyHz: Float,
+    healthStatus: String,
+    history: List<Float>,
+    isConnected: Boolean
+) {
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = CarbonCard),
+        border = BorderStroke(1.dp, CarbonBorder),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("lambda_oscilloscope_card")
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            // Cabeçalho com título, Hz e status
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(10.dp)
+                            .clip(CircleShape)
+                            .background(if (isConnected && frequencyHz >= 0.8f) AstraGreen else if (isConnected) AstraYellow else TextMuted)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "OSCILOSCÓPIO SONDA LAMBDA (PRÉ-CAT)",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = AstraCyan,
+                        letterSpacing = 0.5.sp
+                    )
+                }
+
+                Text(
+                    text = if (isConnected) String.format(Locale.US, "%.3f V", lambdaVoltage) else "0.000 V",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = if (isConnected && lambdaVoltage > 0.45f) AstraGreen else AstraYellow
+                )
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            // Subtítulo com taxa de oscilação e diagnóstico
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (isConnected) "Frequência: ${String.format(Locale.US, "%.1f", frequencyHz)} Hz" else "Frequência: 0.0 Hz",
+                    fontSize = 11.sp,
+                    color = TextPrimary,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = if (isConnected) healthStatus else "Desconectado",
+                    fontSize = 10.sp,
+                    color = if (isConnected && frequencyHz >= 0.8f) AstraGreen else if (isConnected) AstraYellow else TextMuted,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Canvas da Forma de Onda (Waveform)
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(110.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF0F141A))
+                    .border(1.dp, CarbonBorder, RoundedCornerShape(8.dp))
+            ) {
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val w = size.width
+                    val h = size.height
+                    val refY = h * 0.55f // Linha de 450 mV
+
+                    // Linha tracejada de referência estequiométrica (450 mV)
+                    drawLine(
+                        color = Color(0xFF6B5B3E),
+                        start = Offset(0f, refY),
+                        end = Offset(w, refY),
+                        strokeWidth = 2f,
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f)
+                    )
+
+                    // Linhas de grid secundárias
+                    val gridLines = 4
+                    for (i in 1..gridLines) {
+                        val y = h * (i / (gridLines + 1f))
+                        if (kotlin.math.abs(y - refY) > 8f) {
+                            drawLine(
+                                color = Color(0xFF1E2530),
+                                start = Offset(0f, y),
+                                end = Offset(w, y),
+                                strokeWidth = 1f
+                            )
+                        }
+                    }
+
+                    // Se não houver pontos gravados, usa o valor atual ou neutro
+                    val points = if (history.isNotEmpty()) history else listOf(if (isConnected) lambdaVoltage else 0.1f)
+                    val stepX = if (points.size > 1) w / (points.size - 1) else w
+
+                    val path = Path()
+                    points.forEachIndexed { index, volt ->
+                        val clampedVolt = volt.coerceIn(0f, 1.0f)
+                        val x = index * stepX
+                        val y = h * 0.9f - (clampedVolt * h * 0.8f)
+                        if (index == 0) {
+                            path.moveTo(x, y)
+                        } else {
+                            path.lineTo(x, y)
+                        }
+                    }
+
+                    drawPath(
+                        path = path,
+                        color = if (isConnected && lambdaVoltage > 0.45f) AstraGreen else GmAmberLight,
+                        style = Stroke(
+                            width = 3.5f,
+                            cap = StrokeCap.Round,
+                            join = StrokeJoin.Round
+                        )
+                    )
+
+                    // Marcador luminoso no último ponto amostrado
+                    if (points.isNotEmpty()) {
+                        val lastVolt = points.last().coerceIn(0f, 1.0f)
+                        val lastX = (points.size - 1) * stepX
+                        val lastY = h * 0.9f - (lastVolt * h * 0.8f)
+                        drawCircle(
+                            color = Color.White,
+                            radius = 4.5f,
+                            center = Offset(lastX, lastY)
+                        )
+                        drawCircle(
+                            color = if (lastVolt > 0.45f) AstraGreen else GmAmberLight,
+                            radius = 2.5f,
+                            center = Offset(lastX, lastY)
+                        )
+                    }
+                }
+
+                // Indicadores de faixa dentro do canvas
+                Text(
+                    text = "450 mV • Estequiometria",
+                    fontSize = 8.sp,
+                    color = Color(0xFFC4A052),
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .padding(start = 6.dp)
+                )
+
+                Text(
+                    text = "Rica (> 450mV)",
+                    fontSize = 8.sp,
+                    color = AstraGreen.copy(alpha = 0.6f),
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = 4.dp, end = 6.dp)
+                )
+
+                Text(
+                    text = "Pobre (< 450mV)",
+                    fontSize = 8.sp,
+                    color = AstraYellow.copy(alpha = 0.6f),
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(bottom = 4.dp, end = 6.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Text(
+                text = "Em regime aquecido de malha fechada, a sonda cicla entre ~100mV e ~900mV em frequência saudável de 1 a 2 Hz.",
+                fontSize = 9.sp,
+                color = TextMuted,
+                lineHeight = 12.sp
+            )
+        }
+    }
+}
+
+/**
+ * Cartão de Diagnóstico de Saúde da Mistura e Compensação de Combustível (STFT + LTFT)
+ */
+@Composable
+fun FuelTrimHealthCard(
+    stft: Float,
+    ltft: Float,
+    healthLevel: Int,
+    healthMessage: String,
+    isConnected: Boolean
+) {
+    val totalTrim = stft + ltft
+    val badgeColor = when (healthLevel) {
+        0 -> AstraGreen
+        1 -> AstraYellow
+        else -> AstraRedline
+    }
+
+    Card(
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = CarbonCard),
+        border = BorderStroke(1.dp, CarbonBorder),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("fuel_trim_health_card")
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(10.dp)
+                            .clip(CircleShape)
+                            .background(if (isConnected) badgeColor else TextMuted)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "SAÚDE DA MISTURA (FUEL TRIMS STFT + LTFT)",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = TextPrimary,
+                        letterSpacing = 0.5.sp
+                    )
+                }
+
+                Text(
+                    text = if (isConnected) String.format(Locale.US, "%+.1f%%", totalTrim) else "0.0%",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = if (isConnected) badgeColor else TextMuted
+                )
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Barra gráfica com zonas de calibração (-25% a +25%)
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(16.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(CarbonElevated)
+            ) {
+                Row(modifier = Modifier.fillMaxSize()) {
+                    Box(modifier = Modifier.weight(1f).fillMaxSize().background(AstraRedline.copy(alpha = 0.25f)))
+                    Box(modifier = Modifier.weight(1f).fillMaxSize().background(AstraYellow.copy(alpha = 0.25f)))
+                    Box(modifier = Modifier.weight(2f).fillMaxSize().background(AstraGreen.copy(alpha = 0.25f)))
+                    Box(modifier = Modifier.weight(1f).fillMaxSize().background(AstraYellow.copy(alpha = 0.25f)))
+                    Box(modifier = Modifier.weight(1f).fillMaxSize().background(AstraRedline.copy(alpha = 0.25f)))
+                }
+
+                // Marcador da linha zero (ideal)
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .width(2.dp)
+                        .height(16.dp)
+                        .background(Color.White.copy(alpha = 0.7f))
+                )
+
+                // Cursor do ponto atual
+                if (isConnected) {
+                    val normalized = ((totalTrim + 25f) / 50f).coerceIn(0.04f, 0.96f)
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(normalized)
+                            .align(Alignment.CenterStart)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.CenterEnd)
+                                .size(12.dp)
+                                .clip(CircleShape)
+                                .background(badgeColor)
+                                .border(1.5.dp, Color.White, CircleShape)
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text("-25% (Rica)", fontSize = 8.sp, color = TextMuted)
+                Text("-8%", fontSize = 8.sp, color = TextMuted)
+                Text("0% Ideal", fontSize = 8.sp, color = AstraGreen, fontWeight = FontWeight.Bold)
+                Text("+8%", fontSize = 8.sp, color = TextMuted)
+                Text("+25% (Pobre)", fontSize = 8.sp, color = TextMuted)
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+                text = if (isConnected) healthMessage else "Conecte para analisar o balanço de injeção em tempo real.",
+                fontSize = 10.sp,
+                color = if (isConnected) TextPrimary else TextMuted,
+                lineHeight = 14.sp
+            )
+        }
+    }
+}
+
+private data class DashboardHeaderBadgeStyle(
+    val bg: Color,
+    val border: Color,
+    val text: String,
+    val textColor: Color
+)
+

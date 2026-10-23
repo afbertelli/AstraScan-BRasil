@@ -69,30 +69,42 @@ class SerialCommunicationQueue(
                 out.write(formattedCmd.toByteArray(Charsets.US_ASCII))
                 out.flush()
 
+                val buffer = ByteArray(512)
                 val responseBuilder = StringBuilder()
                 val startTime = System.currentTimeMillis()
+                var promptFound = false
 
-                while (System.currentTimeMillis() - startTime < timeoutMs) {
+                while (System.currentTimeMillis() - startTime < timeoutMs && !promptFound) {
                     val available = inStream.available()
                     if (available > 0) {
-                        val b = inStream.read()
-                        if (b == -1) break
-                        val c = b.toChar()
-                        if (c == '>') {
-                            break
+                        val bytesToRead = minOf(buffer.size, available)
+                        val bytesRead = inStream.read(buffer, 0, bytesToRead)
+                        if (bytesRead == -1) break
+                        for (i in 0 until bytesRead) {
+                            val c = (buffer[i].toInt() and 0xFF).toChar()
+                            if (c == '>') {
+                                promptFound = true
+                                break
+                            }
+                            responseBuilder.append(c)
                         }
-                        responseBuilder.append(c)
                     } else {
-                        delay(6)
+                        delay(5)
                     }
                 }
 
-                if (cloneSafetyDelayMs > 0) {
+                if (cloneSafetyDelayMs > 0 && !promptFound) {
                     delay(cloneSafetyDelayMs)
                 }
 
-                val result = responseBuilder.toString().trim()
-                return@withLock if (result.isEmpty()) "NO DATA" else result
+                val rawStr = responseBuilder.toString()
+                // Sanitização avançada de ruído de clones ELM327 (caracteres nulos, ecos parciais, control chars)
+                val sanitized = rawStr
+                    .replace("\u0000", "")
+                    .replace("\r\r", "\r")
+                    .trim()
+
+                return@withLock if (sanitized.isEmpty()) "NO DATA" else sanitized
             } catch (e: Exception) {
                 Log.e("SerialQueue", "Falha de I/O em sendCommand '$command': ${e.message}")
                 return@withLock "ERROR: ${e.message}"

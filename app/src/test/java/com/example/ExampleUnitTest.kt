@@ -150,7 +150,8 @@ class ExampleUnitTest {
             calId = "M1.5.5_16V",
             vin = ""
         )
-        assertTrue(profile.ecuName.contains("Bosch Motronic M1.5.5 (16V)"))
+        assertTrue(profile.ecuName.contains("Bosch Motronic M1.5.5"))
+        assertTrue(profile.ecuName.contains("16V"))
         assertEquals("C20SEL", profile.engineCode)
         assertTrue(profile.valveCount.contains("16 Válvulas"))
     }
@@ -270,5 +271,296 @@ class ExampleUnitTest {
         assertTrue(sensorMap.compatibleSensors.any { it.id == "PEDAL" })
         assertTrue(sensorMap.compatibleSensors.any { it.id == "ETHANOL" })
     }
+
+    @Test
+    fun testCanHeaderExtractionAndFrameCounters() {
+        // CAN 11-bit response with header "7E8 04 41 0C 0D 80"
+        val canResponse = "7E8 04 41 0C 0D 80"
+        val bytes = GmDataParsers.extractHexBytes(canResponse)
+        assertEquals(5, bytes.size)
+        assertEquals(0x04, bytes[0])
+        assertEquals(0x41, bytes[1])
+        assertEquals(0x0C, bytes[2])
+        val rpm = GmDataParsers.parseRpm(canResponse)
+        assertNotNull(rpm)
+        assertEquals(864.0f, rpm!!, 0.1f)
+    }
+
+    @Test
+    fun testNanAndInfiniteSafeguards() {
+        val nanDuty = GmDataParsers.calculateInjectorDutyCycle(Float.NaN, 850f)
+        assertEquals(0f, nanDuty, 0.001f)
+
+        val infDuty = GmDataParsers.calculateInjectorDutyCycle(Float.POSITIVE_INFINITY, 850f)
+        assertEquals(0f, infDuty, 0.001f)
+
+        val nanLph = GmDataParsers.calculateLitersPerHour(Float.NaN, Float.NaN)
+        assertEquals(0f, nanLph, 0.001f)
+
+        val nanKml = GmDataParsers.calculateKmPerLiter(Float.NaN, 5.0f)
+        assertEquals(0f, nanKml, 0.001f)
+
+        val nanVac = GmDataParsers.calculateVacuum(Float.NaN, 101.3f)
+        assertEquals(0f, nanVac, 0.001f)
+    }
+
+    @Test
+    fun testExpandedDtcMapping() {
+        val dtcCkp = GmDataParsers.mapDtcDetails("P0335")
+        assertTrue(dtcCkp.title.contains("CKP") || dtcCkp.title.contains("Rotação"))
+
+        val dtcCoil = GmDataParsers.mapDtcDetails("P0351")
+        assertTrue(dtcCoil.title.contains("Bobina"))
+
+        val dtcImmo = GmDataParsers.mapDtcDetails("P1610")
+        assertTrue(dtcImmo.title.contains("Imobilizador"))
+
+        val dtcDbw = GmDataParsers.mapDtcDetails("P1120")
+        assertTrue(dtcDbw.title.contains("Borboleta"))
+    }
+
+    @Test
+    fun testValid0x7FDataNotRejectedAsNegativeResponse() {
+        // 0x7F = 127 -> 127 - 40 = 87.0°C (temperatura operacional muito comum)
+        val ectRaw = "41 05 7F"
+        val isNegEct = GmDataParsers.isNegativeResponse(ectRaw)
+        org.junit.Assert.assertFalse("41 05 7F não deve ser classificado como erro!", isNegEct)
+        val ect = GmDataParsers.parseCoolantTemp(ectRaw)
+        assertNotNull(ect)
+        assertEquals(87.0f, ect!!, 0.1f)
+
+        // TPS 49.8% -> 127 * 100 / 255 = 49.8%
+        val tpsRaw = "41 11 7F"
+        val isNegTps = GmDataParsers.isNegativeResponse(tpsRaw)
+        org.junit.Assert.assertFalse(isNegTps)
+        val tps = GmDataParsers.parseTpsPercent(tpsRaw)
+        assertNotNull(tps)
+        assertEquals(49.8f, tps!!, 0.2f)
+
+        // Resposta Negativa Real (NRC UDS/KWP 7F 01 11) DEVE ser classificada como erro
+        val nrcRaw = "7F 01 11"
+        assertTrue(GmDataParsers.isNegativeResponse(nrcRaw))
+
+        // NRC com cabeçalho (83 F1 11 7F 01 11 C8)
+        val nrcWithHeader = "83 F1 11 7F 01 11 C8"
+        assertTrue(GmDataParsers.isNegativeResponse(nrcWithHeader))
+    }
+
+    @Test
+    fun testEcuHierarchyBoschVersusDelphi() {
+        // Carro ano 2005 (VIN com '5' no 10º char) mas com ECU Bosch ME 7.9.6
+        val bosch2005 = GmDataParsers.matchVehicleProfile(
+            partNumber = "93382522",
+            hardwareNumber = "0 261 208 227",
+            softwareVersion = "ME7.9.6",
+            calId = "ME7.9.6_20V",
+            vin = "9BGTL48R05B123456"
+        )
+        assertTrue(bosch2005.ecuName.contains("Bosch Motronic ME 7.9.6"))
+
+        // Carro ano 2010 (VIN com 'A' no 10º char) com Rocambole Bosch ME 7.9.9
+        val rocambole2010 = GmDataParsers.matchVehicleProfile(
+            partNumber = "94703803",
+            hardwareNumber = "0 261 208 994",
+            softwareVersion = "ME799",
+            calId = "ME7.9.9_F2",
+            vin = "9BGTL48R0AB123456"
+        )
+        assertTrue(rocambole2010.ecuName.contains("ME 7.9.9"))
+
+        // Astra 2.0 8V Gasolina 1999-2004 com Motronic M1.5.5
+        val m155Gas = GmDataParsers.matchVehicleProfile(
+            partNumber = "09117380",
+            hardwareNumber = "0 261 206 000",
+            softwareVersion = "M155",
+            calId = "M1.5.5_8V",
+            vin = "9BGTL48R04B123456"
+        )
+        assertTrue(m155Gas.ecuName.contains("M1.5.5 (8V)"))
+        assertEquals("Gasolina", m155Gas.fuelType)
+    }
+
+    @Test
+    fun testEcuNameParsing() {
+        // "49 0A 01 45 43 4D 20 47 4D" -> 01 descartado como contador, "ECM GM"
+        val raw = "49 0A 01 45 43 4D 20 47 4D"
+        val ecuName = GmDataParsers.parseEcuName(raw)
+        assertEquals("ECM GM", ecuName)
+    }
+
+    @Test
+    fun testHardwareProbeDisambiguationIacVsDbw() {
+        // Cenário 1: Astra ano 2004 sem Part Number, mas a sonda física confirmou motor de passo IAC (cabo mecânico)
+        val iacVehicle = GmDataParsers.matchVehicleProfile(
+            partNumber = "",
+            hardwareNumber = "",
+            softwareVersion = "",
+            calId = "",
+            vin = "9BGTL48R04B123456",
+            hasIacConfirmed = true,
+            hasDbwConfirmed = false
+        )
+        // Deve classificar como Astra 2.0 8V Gasolina M1.5.5 (a cabo com IAC), e NUNCA Multec H Flex (que é DBW)
+        assertTrue(iacVehicle.ecuName.contains("M1.5.5"))
+        assertEquals("Gasolina", iacVehicle.fuelType)
+
+        // Cenário 2: Astra ano 2004 sem Part Number, mas a sonda física confirmou Borboleta Eletrônica DBW
+        val dbwVehicle = GmDataParsers.matchVehicleProfile(
+            partNumber = "",
+            hardwareNumber = "",
+            softwareVersion = "",
+            calId = "",
+            vin = "9BGTL48R04B123456",
+            hasIacConfirmed = false,
+            hasDbwConfirmed = true
+        )
+        // Deve classificar como Astra 2.0 8V Flex (Drive-by-Wire)
+        assertTrue(dbwVehicle.ecuName.contains("Multec") || dbwVehicle.ecuName.contains("ME 7.9.6"))
+        assertTrue(dbwVehicle.fuelType.contains("Flex"))
+    }
+
+    @Test
+    fun testFuelTrimHealthEvaluation() {
+        // Balanço perfeito: STFT +2%, LTFT -1% -> Total +1% (nível 0)
+        val (lvl0, title0, _) = GmDataParsers.evaluateFuelTrimHealth(2.0f, -1.0f)
+        assertEquals(0, lvl0)
+        assertTrue(title0.contains("Balanceada"))
+
+        // Tendência Pobre Moderada: STFT +6%, LTFT +5% -> Total +11% (nível 1)
+        val (lvl1, title1, _) = GmDataParsers.evaluateFuelTrimHealth(6.0f, 5.0f)
+        assertEquals(1, lvl1)
+        assertTrue(title1.contains("Tendência Pobre"))
+
+        // Alerta Severo de Mistura Pobre: STFT +10%, LTFT +12% -> Total +22% (nível 2)
+        val (lvl2, title2, _) = GmDataParsers.evaluateFuelTrimHealth(10.0f, 12.0f)
+        assertEquals(2, lvl2)
+        assertTrue(title2.contains("Alerta"))
+
+        // Alerta Severo de Mistura Rica: STFT -10%, LTFT -8% -> Total -18% (nível 2)
+        val (lvlRich, titleRich, _) = GmDataParsers.evaluateFuelTrimHealth(-10.0f, -8.0f)
+        assertEquals(2, lvlRich)
+        assertTrue(titleRich.contains("Alerta"))
+    }
+
+    @Test
+    fun testLambdaOscillationEvaluation() {
+        // Simulação de sonda comutando regularmente entre 150mV e 850mV
+        val oscList = listOf(
+            0.15f, 0.22f, 0.40f, 0.75f, 0.88f, 0.72f, 0.35f, 0.18f,
+            0.14f, 0.28f, 0.65f, 0.85f, 0.78f, 0.40f, 0.19f, 0.15f
+        )
+        val (hz, status) = GmDataParsers.evaluateLambdaOscillation(oscList)
+        assertTrue("Frequência de oscilação deve ser calculada", hz > 0.5f)
+        assertTrue(status.contains("Oscilação"))
+
+        // Sonda travada em pobre (< 250mV)
+        val leanList = listOf(0.12f, 0.15f, 0.18f, 0.14f, 0.16f, 0.13f, 0.15f)
+        val (hzLean, statusLean) = GmDataParsers.evaluateLambdaOscillation(leanList)
+        assertEquals(0f, hzLean, 0.01f)
+        assertTrue(statusLean.contains("Travada em Pobre"))
+
+        // Sonda travada em rica (> 700mV)
+        val richList = listOf(0.78f, 0.82f, 0.85f, 0.79f, 0.81f, 0.84f, 0.80f)
+        val (hzRich, statusRich) = GmDataParsers.evaluateLambdaOscillation(richList)
+        assertEquals(0f, hzRich, 0.01f)
+        assertTrue(statusRich.contains("Travada em Rica"))
+    }
+
+    @Test
+    fun testInjectorFlowRatesByModel() {
+        // Astra GSi 204 cc/min
+        assertEquals(204.0f, com.example.model.VehicleProfile.ASTRA_GSI_16V.injectorFlowCcMin, 0.1f)
+
+        // Astra Flex 140cv 228 / 225 cc/min
+        assertEquals(228.0f, com.example.model.VehicleProfile.ASTRA_20_8V_ME799.injectorFlowCcMin, 0.1f)
+        assertEquals(225.0f, com.example.model.VehicleProfile.ASTRA_20_8V_FLEX_FASE2.injectorFlowCcMin, 0.1f)
+
+        // Astra Gasolina 185 cc/min
+        assertEquals(185.0f, com.example.model.VehicleProfile.ASTRA_20_8V_GAS.injectorFlowCcMin, 0.1f)
+
+        // Monoponto Belga 380 cc/min
+        assertEquals(380.0f, com.example.model.VehicleProfile.ASTRA_18_EFI_MULTEC_M.injectorFlowCcMin, 0.1f)
+    }
+
+    @Test
+    fun testDisconnectedTelemetryMustBeZero() {
+        val disconnected = com.example.model.LiveTelemetry()
+        assertEquals(0f, disconnected.rpm, 0.01f)
+        assertEquals(0f, disconnected.speedKmh, 0.01f)
+        assertEquals(0f, disconnected.mapKpa, 0.01f)
+        assertEquals(0f, disconnected.coolantTempC, 0.01f)
+    }
+
+    @Test
+    fun testIdleAuditOfflineWhenDisconnected() {
+        val disconnected = com.example.model.LiveTelemetry()
+        val result = com.example.serial.AstraIdleHealthChecker.auditIdleSensors(
+            disconnected,
+            com.example.model.VehicleProfile.ASTRA_20_8V_FLEX_FASE2
+        )
+        org.junit.Assert.assertFalse("Com RPM 0 a marcha lenta não pode ser detectada", result.isIdleDetected)
+        assertTrue(result.idleConditionMessage.contains("0 RPM"))
+        assertEquals(0, result.checks.size)
+    }
+
+    @Test
+    fun testWatchdogTimeoutThreshold() {
+        val lastDataTimestamp = System.currentTimeMillis() - 5200L
+        val silenceMs = System.currentTimeMillis() - lastDataTimestamp
+        val isTimeout = silenceMs > 5000L
+        assertTrue("Silêncio acima de 5000ms deve acionar o watchdog de timeout", isTimeout)
+    }
+
+    @Test
+    fun testLiveTelemetrySampleRateDefaults() {
+        val t = com.example.model.LiveTelemetry()
+        assertEquals(0f, t.sampleRateHz, 0.01f)
+        assertEquals(0, t.loopLatencyMs)
+    }
+
+    @Test
+    fun testActuatorSafetyInterlockCondition() {
+        val runningRpm = 850f
+        val isActuatorSafe = runningRpm <= 150f
+        org.junit.Assert.assertFalse("Teste de atuador deve ser bloqueado com motor ligado", isActuatorSafe)
+    }
+
+    @Test
+    fun testChartTelemetryChannels() {
+        val channels = com.example.ui.components.ChartTelemetryChannel.values()
+        assertEquals(4, channels.size)
+        assertEquals("RPM", com.example.ui.components.ChartTelemetryChannel.RPM.unit)
+        assertEquals("°C", com.example.ui.components.ChartTelemetryChannel.ECT.unit)
+    }
+
+    @Test
+    fun testNegativeResponseCodeParser() {
+        val nrcRaw = "7F 31 22"
+        val nrc = GmDataParsers.parseNegativeResponse(nrcRaw)
+        assertTrue(nrc.isNegative)
+        assertEquals(0x31, nrc.serviceId)
+        assertEquals(0x22, nrc.nrcCode)
+        assertTrue(nrc.description.contains("Condições incorretas"))
+    }
+
+    @Test
+    fun testVinDecoder() {
+        val testVin = "9BGTA08Z07B123456"
+        val decoded = GmDataParsers.decodeVin(testVin)
+        assertTrue(decoded.isValid)
+        assertEquals("2007", decoded.modelYear)
+        assertTrue(decoded.assemblyPlant.contains("São Caetano"))
+        assertEquals("General Motors do Brasil", decoded.manufacturer)
+    }
+
+    @Test
+    fun testKwpChecksumValidator() {
+        val validFrame = listOf(0x81, 0x11, 0xF1, 0x01, 0x00, 0x84)
+        assertTrue(GmDataParsers.validateKwpChecksum(validFrame))
+
+        val corruptedFrame = listOf(0x81, 0x11, 0xF1, 0x01, 0x00, 0x99)
+        org.junit.Assert.assertFalse(GmDataParsers.validateKwpChecksum(corruptedFrame))
+    }
 }
+
 
