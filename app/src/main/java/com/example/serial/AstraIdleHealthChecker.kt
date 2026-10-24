@@ -1,5 +1,6 @@
 package com.example.serial
 
+import com.example.model.EngineOperatingRegime
 import com.example.model.LiveTelemetry
 import com.example.model.VehicleProfile
 import java.util.Locale
@@ -502,5 +503,168 @@ object AstraIdleHealthChecker {
             resolvedIssues = resolvedIssues,
             summaryMessage = summary
         )
+    }
+
+    /**
+     * Identifica em tempo real o regime dinâmico de operação física do motor GM Família II
+     */
+    fun detectOperatingRegime(t: LiveTelemetry): EngineOperatingRegime {
+        if (t.rpm < 350f) return EngineOperatingRegime.OFF
+        if (t.coolantTempC < 70f && t.coolantTempC > 0f) return EngineOperatingRegime.COLD_START
+        if (t.throttlePercent >= 70f || (t.mapKpa >= 88f && t.rpm > 2000f)) return EngineOperatingRegime.WOT_FULL_LOAD
+        if (t.throttlePercent <= 2.5f && t.rpm in 450f..1150f) return EngineOperatingRegime.HOT_IDLE
+        return EngineOperatingRegime.PARTIAL_LOAD
+    }
+
+    /**
+     * Avalia os parâmetros da injeção com faixas nominais adaptativas conforme o regime atual do motor
+     */
+    fun evaluateDynamicRegimeSensors(t: LiveTelemetry, p: VehicleProfile): List<SensorHealthCheck> {
+        val regime = detectOperatingRegime(t)
+        val checks = mutableListOf<SensorHealthCheck>()
+        val isEthanol = t.ethanolPercentage > 50f || (t.estimatedAfRatio in 8.5f..11.5f)
+
+        when (regime) {
+            EngineOperatingRegime.OFF -> {
+                return evaluateAllSensors(t, p, isEngineRunning = false)
+            }
+            EngineOperatingRegime.COLD_START -> {
+                // 1. Rotação em aquecimento
+                val isRpmOk = t.rpm in 950f..1350f
+                checks.add(
+                    SensorHealthCheck(
+                        sensorId = "rpm",
+                        sensorName = "Rotação (Fase Fria)",
+                        currentValueStr = "${t.rpm.toInt()}",
+                        numericValue = t.rpm,
+                        nominalRange = "1.000 - 1.300",
+                        unit = "RPM",
+                        isOk = isRpmOk,
+                        issueDescription = if (!isRpmOk) "Rotação de aquecimento fora da faixa esperada para motor frio." else null
+                    )
+                )
+                // 2. MAP em aquecimento
+                val isMapOk = t.mapKpa in 32f..55f
+                checks.add(
+                    SensorHealthCheck(
+                        sensorId = "map",
+                        sensorName = "Pressão no Coletor (MAP)",
+                        currentValueStr = "${t.mapKpa.toInt()}",
+                        numericValue = t.mapKpa,
+                        nominalRange = "35 - 50",
+                        unit = "kPa",
+                        isOk = isMapOk,
+                        issueDescription = if (!isMapOk) "Vácuo em fase fria fora dos parâmetros normais." else null
+                    )
+                )
+                // 3. Tempo de Injeção enriquecido
+                val isTiOk = t.injectionTimeMs in 2.8f..6.0f
+                checks.add(
+                    SensorHealthCheck(
+                        sensorId = "ti",
+                        sensorName = "Tempo de Injeção (T.I.)",
+                        currentValueStr = String.format(Locale.US, "%.2f", t.injectionTimeMs),
+                        numericValue = t.injectionTimeMs,
+                        nominalRange = "3.00 - 5.50 (Enriquecido)",
+                        unit = "ms",
+                        isOk = isTiOk,
+                        issueDescription = if (!isTiOk) "Tempo de injeção em fase fria fora da faixa de enriquecimento da ECU." else null
+                    )
+                )
+            }
+            EngineOperatingRegime.HOT_IDLE -> {
+                return evaluateAllSensors(t, p, isEngineRunning = true)
+            }
+            EngineOperatingRegime.PARTIAL_LOAD -> {
+                // Rotação em cruzeiro
+                val isRpmOk = t.rpm in 1100f..5500f
+                checks.add(
+                    SensorHealthCheck(
+                        sensorId = "rpm",
+                        sensorName = "Rotação em Cruzeiro",
+                        currentValueStr = "${t.rpm.toInt()}",
+                        numericValue = t.rpm,
+                        nominalRange = "1.200 - 4.500",
+                        unit = "RPM",
+                        isOk = isRpmOk
+                    )
+                )
+                // MAP em carga parcial
+                val isMapOk = t.mapKpa in 32f..88f
+                checks.add(
+                    SensorHealthCheck(
+                        sensorId = "map",
+                        sensorName = "Pressão no Coletor (MAP)",
+                        currentValueStr = "${t.mapKpa.toInt()}",
+                        numericValue = t.mapKpa,
+                        nominalRange = "35 - 85",
+                        unit = "kPa",
+                        isOk = isMapOk
+                    )
+                )
+                // Avanço em cruzeiro
+                val isSparkOk = t.sparkAdvanceDeg in 15f..42f
+                checks.add(
+                    SensorHealthCheck(
+                        sensorId = "spark",
+                        sensorName = "Avanço de Ignição (Ponto)",
+                        currentValueStr = String.format(Locale.US, "%.1f", t.sparkAdvanceDeg),
+                        numericValue = t.sparkAdvanceDeg,
+                        nominalRange = "18 - 38",
+                        unit = "° APMS",
+                        isOk = isSparkOk,
+                        issueDescription = if (!isSparkOk) "Curva de avanço em cruzeiro atípica." else null
+                    )
+                )
+            }
+            EngineOperatingRegime.WOT_FULL_LOAD -> {
+                // Borboleta em plena carga
+                val isTpsOk = t.throttlePercent >= 68f
+                checks.add(
+                    SensorHealthCheck(
+                        sensorId = "tps",
+                        sensorName = "Posição Borboleta (WOT)",
+                        currentValueStr = String.format(Locale.US, "%.1f", t.throttlePercent),
+                        numericValue = t.throttlePercent,
+                        nominalRange = "70 - 100",
+                        unit = "%",
+                        isOk = isTpsOk,
+                        issueDescription = if (!isTpsOk) "Abertura total da borboleta não atingida em plena aceleração." else null
+                    )
+                )
+                // MAP atmosférico em plena carga
+                val isMapWotOk = t.mapKpa >= 88f
+                checks.add(
+                    SensorHealthCheck(
+                        sensorId = "map",
+                        sensorName = "Pressão Coletor (WOT)",
+                        currentValueStr = "${t.mapKpa.toInt()}",
+                        numericValue = t.mapKpa,
+                        nominalRange = "90 - 102 (Atmosférico)",
+                        unit = "kPa",
+                        isOk = isMapWotOk,
+                        issueDescription = if (!isMapWotOk) "Restrição detectada na admissão de ar (MAP baixo em WOT)." else null
+                    )
+                )
+            }
+        }
+
+        // Adiciona checagens elétricas e de temperatura comuns
+        val isVoltOk = t.ecuBatteryVoltage in 13.4f..14.8f || t.elmBatteryVoltage in 13.4f..14.8f
+        val effectiveVolt = if (t.ecuBatteryVoltage > 5f) t.ecuBatteryVoltage else t.elmBatteryVoltage
+        checks.add(
+            SensorHealthCheck(
+                sensorId = "volt",
+                sensorName = "Tensão Alternador / Bateria",
+                currentValueStr = String.format(Locale.US, "%.1f", effectiveVolt),
+                numericValue = effectiveVolt,
+                nominalRange = "13.5 - 14.6",
+                unit = "V",
+                isOk = isVoltOk,
+                issueDescription = if (!isVoltOk && effectiveVolt < 13.2f) "Tensão baixa do alternador em regime de funcionamento." else null
+            )
+        )
+
+        return checks
     }
 }

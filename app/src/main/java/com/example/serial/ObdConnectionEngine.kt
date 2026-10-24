@@ -6,6 +6,9 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothSocket
 import android.util.Log
 import com.example.model.AstraModule
+import com.example.model.ElmChipBenchmark
+import com.example.model.ElmQualityTier
+import com.example.model.HeartbeatStatus
 import com.example.model.ProtocolType
 import com.example.model.ScanState
 import com.example.model.TimeoutCalibration
@@ -27,7 +30,7 @@ import java.util.UUID
  * - Abertura resiliente de sockets Bluetooth RFCOMM/SPP com triplo fallback.
  * - Reset e parametrização segura de buffers do chip ELM327.
  * - Negociação progressiva de protocolos na Linha K e CAN (KWP2000 Fast/Slow, ISO 9141-2, CAN).
- * - Monitoramento contínuo (Watchdog Keep-Alive 3E Tester Present) para impedir timeout da ECU física.
+ * - Monitoramento contínuo Heartbeat (verificação de vida a cada 2s com desconexão automática).
  * - Resiliência a queda de tensão no arranque do motor (cranking drop).
  * - Suporte a múltiplos módulos Astra (Injeção, Painel MID, Câmbio Aisin, ABS, Airbag, Imobilizador).
  * - Atalho de conexão rápida (Bypass do último perfil de sucesso).
@@ -37,11 +40,90 @@ class ObdConnectionEngine(
     private val scope: CoroutineScope
 ) {
     companion object {
+        const val HEARTBEAT_INTERVAL_MS = 2000L
         val SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
         private const val TAG = "ObdConnectionEngine"
+
+        /**
+         * Valida se a resposta serial da ECU ao comando de baixo custo confirma que ela está ativa.
+         */
+        fun validateHeartbeatResponse(resp: String): Boolean {
+            val clean = resp.uppercase().trim()
+            if (clean.isEmpty()) return false
+            if (clean.contains("NO DATA") ||
+                clean.contains("UNABLE TO CONNECT") ||
+                clean.contains("BUS INIT: ... ERROR") ||
+                clean.contains("CAN ERROR") ||
+                clean.contains("STOPPED") ||
+                clean.contains("FB ERROR") ||
+                clean.contains("ERROR") ||
+                clean == "?" ||
+                clean.contains("?\r")
+            ) {
+                return false
+            }
+            return clean.contains("7E") ||
+                   clean.contains("41 00") ||
+                   clean.contains("41 0C") ||
+                   clean.contains("61 02") ||
+                   clean.contains("61 01") ||
+                   clean.contains("41 ") ||
+                   clean.contains("OK")
+        }
+
+        fun evaluateElmHardware(ati: String, at1: String, latencyMs: Long): ElmChipBenchmark {
+            val upperAti = ati.uppercase()
+            val upperAt1 = at1.uppercase()
+            val isCloneV21 = upperAti.contains("V2.1") || upperAti.contains("2.1")
+            val isV15 = upperAti.contains("V1.5") || upperAti.contains("1.5") || upperAti.contains("V1.4") || upperAti.contains("1.4")
+            val hasPicSignature = upperAt1.contains("OBD") || upperAt1.contains("PIC") || upperAt1.contains("SCAN")
+
+            val tier = when {
+                isV15 && hasPicSignature -> ElmQualityTier.EXCELLENT_PIC18F
+                isV15 -> ElmQualityTier.GOOD_COMPATIBLE
+                isCloneV21 -> ElmQualityTier.QUESTIONABLE_CLONE
+                upperAti.contains("ELM") -> ElmQualityTier.GOOD_COMPATIBLE
+                else -> ElmQualityTier.UNSTABLE
+            }
+
+            val desc = when (tier) {
+                ElmQualityTier.EXCELLENT_PIC18F -> "Chipset PIC18F25K80 de alta fidelidade com suporte completo à Linha K (ISO 14230/9141)."
+                ElmQualityTier.GOOD_COMPATIBLE -> "Adaptador v1.5 compatível com os protocolos do GM Astra."
+                ElmQualityTier.QUESTIONABLE_CLONE -> "Clone v2.1 de baixo custo. Pode apresentar perda de pacotes na Linha K (Pino 7)."
+                ElmQualityTier.UNSTABLE -> "Resposta atípica do chip. Recomenda-se adaptador com chip PIC18F25K80."
+                ElmQualityTier.UNKNOWN -> "Aguardando teste de hardware."
+            }
+
+            return ElmChipBenchmark(
+                versionString = if (ati.isNotBlank()) ati else "ELM327",
+                deviceDescription = if (at1.isNotBlank()) at1 else "Dispositivo Bluetooth",
+                qualityTier = tier,
+                isKLineCertified = tier != ElmQualityTier.UNSTABLE && tier != ElmQualityTier.QUESTIONABLE_CLONE,
+                latencyMs = latencyMs,
+                recommendationText = desc
+            )
+        }
     }
 
     private val serialQueue = SerialCommunicationQueue()
+
+    private val _elmBenchmark = MutableStateFlow(ElmChipBenchmark())
+    val elmBenchmark: StateFlow<ElmChipBenchmark> = _elmBenchmark.asStateFlow()
+
+    private val _heartbeatStatus = MutableStateFlow(HeartbeatStatus())
+    val heartbeatStatus: StateFlow<HeartbeatStatus> = _heartbeatStatus.asStateFlow()
+
+    val isHeartbeatPaused = MutableStateFlow(false)
+
+    fun pauseHeartbeat() {
+        isHeartbeatPaused.value = true
+    }
+
+    fun resumeHeartbeat() {
+        isHeartbeatPaused.value = false
+    }
+
+    var onHeartbeatFailed: (() -> Unit)? = null
 
     private val _scanState = MutableStateFlow(ScanState.IDLE)
     val scanState: StateFlow<ScanState> = _scanState.asStateFlow()
@@ -81,6 +163,8 @@ class ObdConnectionEngine(
     private var activeDevice: BluetoothDevice? = null
     private var keepAliveJob: Job? = null
     private var lastTrafficTimestamp: Long = 0L
+    var activeHeader: String = "81 11 F1"
+        private set
     var lastPhysicalEcuResponseTimestamp: Long = 0L
         private set
 
@@ -197,6 +281,16 @@ class ObdConnectionEngine(
         val zResp = sendCommand("AT Z", timeoutMs = 2500L)
         logTerminal("< AT Z: $zResp")
         delay(350)
+
+        // Benchmark de Hardware e Certificação de Chipset ELM327 (PIC18F25K80 vs Clones)
+        val atiResp = sendCommand("ATI", timeoutMs = 800L).trim()
+        val at1Resp = sendCommand("AT @1", timeoutMs = 600L).trim()
+        val benchStart = System.currentTimeMillis()
+        sendCommand("AT I", timeoutMs = 600L)
+        val benchLatency = (System.currentTimeMillis() - benchStart).coerceAtLeast(1L)
+        val benchmark = evaluateElmHardware(atiResp, at1Resp, benchLatency)
+        _elmBenchmark.value = benchmark
+        logTerminal("AUDITORIA ELM327: ${benchmark.versionString} [${benchmark.qualityTier.label}] - Latência: ${benchLatency}ms")
 
         sendCommand("AT E0", timeoutMs = 600L)
         sendCommand("AT L0", timeoutMs = 600L)
@@ -334,6 +428,7 @@ class ObdConnectionEngine(
         logTerminal("< 01 00 (Camada 1 KWP Fast 11): $resp01")
         diagnosticarRespostaELM(resp01)
         if (resp01.contains("41 00") || resp01.contains("41 0C") || validarRespostaCentral()) {
+            activeHeader = "81 11 F1"
             _detectedProtocol.value = ProtocolType.KWP_FAST
             logTerminal("SUCESSO: Camada 1 conectada (KWP Fast Init - Delphi Multec H).")
             return true
@@ -359,6 +454,7 @@ class ObdConnectionEngine(
         logTerminal("< 01 00 (Camada 2 KWP Fast 10): $resp")
         diagnosticarRespostaELM(resp)
         if (resp.contains("41 00") || resp.contains("41 0C") || validarRespostaCentral()) {
+            activeHeader = "81 10 F1"
             _detectedProtocol.value = ProtocolType.KWP_FAST
             logTerminal("SUCESSO: Camada 2 conectada (KWP Fast Init - Bosch ME 7.9.6).")
             return true
@@ -381,6 +477,7 @@ class ObdConnectionEngine(
         logTerminal("< 01 00 (Camada 3 KWP Fast 33): $resp")
         diagnosticarRespostaELM(resp)
         if (resp.contains("41 00") || resp.contains("41 0C") || validarRespostaCentral()) {
+            activeHeader = "81 33 F1"
             _detectedProtocol.value = ProtocolType.KWP_FAST
             logTerminal("SUCESSO: Camada 3 conectada (KWP Fast Init - Padrão ISO 14230-4).")
             return true
@@ -404,6 +501,7 @@ class ObdConnectionEngine(
         logTerminal("< 01 00 (Camada 4 KWP Slow 11): $resp")
         diagnosticarRespostaELM(resp)
         if (resp.contains("41 00") || resp.contains("41 0C") || validarRespostaCentral()) {
+            activeHeader = "81 11 F1"
             _detectedProtocol.value = ProtocolType.KWP_SLOW
             logTerminal("SUCESSO: Camada 4 conectada (KWP Slow Init - Multec Antiga).")
             return true
@@ -427,6 +525,7 @@ class ObdConnectionEngine(
         logTerminal("< 01 00 (Camada 5 KWP Slow 10): $resp")
         diagnosticarRespostaELM(resp)
         if (resp.contains("41 00") || resp.contains("41 0C") || validarRespostaCentral()) {
+            activeHeader = "81 10 F1"
             _detectedProtocol.value = ProtocolType.KWP_SLOW
             logTerminal("SUCESSO: Camada 5 conectada (KWP Slow Init - Bosch Gasolina).")
             return true
@@ -450,6 +549,7 @@ class ObdConnectionEngine(
         logTerminal("< 01 00 (Camada 6 KWP Slow 01): $resp")
         diagnosticarRespostaELM(resp)
         if (resp.contains("41 00") || resp.contains("41 0C") || validarRespostaCentral()) {
+            activeHeader = "81 01 F1"
             _detectedProtocol.value = ProtocolType.KWP_SLOW
             logTerminal("SUCESSO: Camada 6 conectada (KWP Slow Init - Bosch Motronic M 1.5.5 16V).")
             return true
@@ -471,6 +571,7 @@ class ObdConnectionEngine(
         logTerminal("< 01 00 (Camada 7 ISO 9141 SAE): $resp")
         diagnosticarRespostaELM(resp)
         if (resp.contains("41 00") || resp.contains("41 0C") || resp.contains("41 05") || validarRespostaCentral()) {
+            activeHeader = "68 6A F1"
             _detectedProtocol.value = ProtocolType.ISO_9141
             logTerminal("SUCESSO: Camada 7 conectada (ISO 9141-2 SAE).")
             return true
@@ -491,6 +592,7 @@ class ObdConnectionEngine(
         logTerminal("< 01 00 (Camada 8 ISO 9141 Direto): $resp")
         diagnosticarRespostaELM(resp)
         if (resp.contains("41 00") || resp.contains("41 0C") || validarRespostaCentral()) {
+            activeHeader = "68 11 F1"
             _detectedProtocol.value = ProtocolType.ISO_9141
             logTerminal("SUCESSO: Camada 8 conectada (ISO 9141-2 Direto GM).")
             return true
@@ -510,6 +612,7 @@ class ObdConnectionEngine(
         val canResp = sendCommand("01 00", timeoutMs = 2000L)
         logTerminal("< 01 00 (Camada 9 CAN 11-bit): $canResp")
         if (canResp.contains("41 00") || canResp.contains("41 0C") || validarRespostaCentral()) {
+            activeHeader = "7E0"
             _detectedProtocol.value = ProtocolType.CAN_500K
             logTerminal("SUCESSO: Camada 9 conectada (CAN 11-bit 500k).")
             return true
@@ -528,6 +631,7 @@ class ObdConnectionEngine(
         val canResp = sendCommand("01 00", timeoutMs = 2000L)
         logTerminal("< 01 00 (Camada 10 CAN 29-bit): $canResp")
         if (canResp.contains("41 00") || canResp.contains("41 0C") || validarRespostaCentral()) {
+            activeHeader = "18DB33F1"
             _detectedProtocol.value = ProtocolType.CAN_500K
             logTerminal("SUCESSO: Camada 10 conectada (CAN 29-bit 500k).")
             return true
@@ -580,10 +684,22 @@ class ObdConnectionEngine(
             val dpResp = sendCommand("AT DP", timeoutMs = 800L).uppercase()
             logTerminal("< Protocolo Detectado pelo ELM327: $dpResp")
             _detectedProtocol.value = when {
-                dpResp.contains("CAN") -> ProtocolType.CAN_500K
-                dpResp.contains("FAST") || dpResp.contains("14230") -> ProtocolType.KWP_FAST
-                dpResp.contains("9141") -> ProtocolType.ISO_9141
-                else -> ProtocolType.KWP_SLOW
+                dpResp.contains("CAN") -> {
+                    activeHeader = "7E0"
+                    ProtocolType.CAN_500K
+                }
+                dpResp.contains("FAST") || dpResp.contains("14230") -> {
+                    activeHeader = "81 11 F1"
+                    ProtocolType.KWP_FAST
+                }
+                dpResp.contains("9141") -> {
+                    activeHeader = "68 6A F1"
+                    ProtocolType.ISO_9141
+                }
+                else -> {
+                    activeHeader = "81 11 F1"
+                    ProtocolType.KWP_SLOW
+                }
             }
             lastSuccessfulProfile.value = "PERFIL_1_KWP_FAST_11"
             return true
@@ -667,64 +783,152 @@ class ObdConnectionEngine(
     }
 
     /**
-     * Watchdog de manutenção de sessão:
-     * - Envia 3E (Tester Present) a cada 2000ms para impedir que a ECU feche o canal.
-     * - Monitora periodicamente a tensão da bateria.
-     * - Se a tensão cair (partida do motor) ou se o socket cair, executa auto-reconexão silenciosa.
+     * Executa um pulso de 'Heartbeat' (verificação de vida) na ECU a cada 2 segundos.
+     * Envia um comando de baixíssimo custo (Tester Present "3E" ou Supported PIDs "01 00")
+     * para garantir que a ECU física ainda está ativa e responsiva.
+     * Retorna true se a central responder com confirmação positiva; false caso falhe.
+     */
+    suspend fun sendHeartbeatPulse(): Boolean {
+        val socket = activeSocket
+        if (socket == null || !socket.isConnected) {
+            _heartbeatStatus.value = _heartbeatStatus.value.copy(
+                isAlive = false,
+                statusDescription = "Socket Bluetooth desconectado"
+            )
+            return false
+        }
+
+        // Seleciona o comando de baixo custo ideal conforme o protocolo ativo:
+        // - KWP2000 / UDS / CAN: "3E" (Tester Present ISO 14230/15765)
+        // - OBD2 SAE: "01 00" (Read Supported PIDs)
+        val lowCostCmd = when (detectedProtocol.value) {
+            ProtocolType.KWP_FAST, ProtocolType.KWP_SLOW, ProtocolType.CAN_500K, ProtocolType.CAN_250K -> "3E"
+            else -> "01 00"
+        }
+
+        val pulseStartMs = System.currentTimeMillis()
+        var response = ""
+        try {
+            response = sendCommand(lowCostCmd, timeoutMs = 800L)
+            // Se o clone ELM retornar '?' para 3E puro sem header, faz fallback imediato para 01 00
+            if (response.contains("?") && lowCostCmd == "3E") {
+                response = sendCommand("01 00", timeoutMs = 800L)
+            }
+        } catch (e: Exception) {
+            logTerminal("💔 [HEARTBEAT] Exceção durante envio de pulso: ${e.message}")
+            response = "ERROR: ${e.message}"
+        }
+
+        val pulseLatency = System.currentTimeMillis() - pulseStartMs
+        val isPulseAlive = validateHeartbeatResponse(response)
+        val current = _heartbeatStatus.value
+
+        if (isPulseAlive) {
+            notifyPhysicalDataReceived()
+            _heartbeatStatus.value = current.copy(
+                isAlive = true,
+                lastPulseTimestamp = System.currentTimeMillis(),
+                pulseLatencyMs = pulseLatency,
+                totalPulsesSent = current.totalPulsesSent + 1,
+                consecutiveFailures = 0,
+                lastCommandSent = lowCostCmd,
+                lastResponse = response.trim(),
+                statusDescription = "ECU Ativa (${pulseLatency}ms)"
+            )
+            return true
+        } else {
+            val failures = current.consecutiveFailures + 1
+            _heartbeatStatus.value = current.copy(
+                isAlive = false,
+                pulseLatencyMs = pulseLatency,
+                totalPulsesSent = current.totalPulsesSent + 1,
+                consecutiveFailures = failures,
+                lastCommandSent = lowCostCmd,
+                lastResponse = response.trim(),
+                statusDescription = "Falha no pulso ($response)"
+            )
+            logTerminal("💔 [HEARTBEAT] Pulso falhou! Resposta inválida ou ausente da ECU: '$response' (${pulseLatency}ms)")
+            return false
+        }
+    }
+
+    /**
+     * Executa a desconexão automática imediata em caso de falha no pulso de vida (Heartbeat).
+     */
+    fun handleHeartbeatFailure(reason: String) {
+        logTerminal("💔 [HEARTBEAT] FALHA NO PULSO DE VIDA DA ECU! $reason")
+        logTerminal("⚠️ Executando DESCONEXÃO AUTOMÁTICA de segurança.")
+
+        _heartbeatStatus.value = _heartbeatStatus.value.copy(
+            isAlive = false,
+            statusDescription = "Desconectado por falha no pulso"
+        )
+
+        disconnect()
+
+        updateScanState(
+            ScanState.ERROR,
+            "Desconexão automática: Heartbeat da ECU falhou (sem pulso de resposta em 2s). Verifique a ignição ou conector OBD2."
+        )
+
+        onHeartbeatFailed?.invoke()
+    }
+
+    /**
+     * Monitor Heartbeat (Verificação de vida da ECU a cada 2 segundos):
+     * - Envia pulso de verificação de vida a cada 2000ms com comando de baixo custo ("3E" ou "01 00").
+     * - Garante que a ECU ainda está ativa e pronta para receber consultas.
+     * - Desconecta automaticamente e alerta o usuário caso o pulso falhe.
+     * - Inclui watchdog de silêncio de 5s e monitoramento periódico de tensão da bateria (AT RV).
      */
     private fun startKeepAliveWorker() {
         keepAliveJob?.cancel()
+        _heartbeatStatus.value = HeartbeatStatus(
+            isAlive = true,
+            statusDescription = "Iniciando monitoramento de pulso (2s)..."
+        )
         keepAliveJob = scope.launch(Dispatchers.IO) {
-            var consecutiveErrors = 0
+            logTerminal("❤️ [HEARTBEAT] Monitor de vida ativo: pulso de baixo custo a cada 2s.")
             while (isActive) {
-                delay(2000)
+                delay(HEARTBEAT_INTERVAL_MS)
 
-                // Watchdog: Timeout se a ECU física estiver conectada mas ficar > 5s sem responder dados
-                if (_isPhysicalEcuConnected.value && lastPhysicalEcuResponseTimestamp > 0L) {
+                if (!_isPhysicalEcuConnected.value || !_isConnected.value) {
+                    break
+                }
+
+                if (isHeartbeatPaused.value) {
+                    delay(500)
+                    continue
+                }
+
+                // Watchdog de silêncio: se > 5000ms sem qualquer byte da ECU física
+                if (lastPhysicalEcuResponseTimestamp > 0L) {
                     val silenceMs = System.currentTimeMillis() - lastPhysicalEcuResponseTimestamp
                     if (silenceMs > 5000L) {
-                        logTerminal("WATCHDOG TIMEOUT (5s): Central permaneceu ${silenceMs / 1000}s sem responder. Declarando desconexão física da ECU.")
-                        setPhysicalEcuConnected(false)
-                        updateScanState(
-                            ScanState.ERROR,
-                            "Timeout de 5 segundos: Central parou de responder dados. Verifique ignição e conector OBD2."
-                        )
+                        handleHeartbeatFailure("Watchdog: Central permaneceu ${silenceMs / 1000}s sem responder.")
+                        break
                     }
                 }
 
-                val timeSinceLast = System.currentTimeMillis() - lastTrafficTimestamp
-                if (timeSinceLast >= 2000 && _isConnected.value) {
-                    try {
-                        val resp = sendCommand("3E", timeoutMs = 600L)
-                        if (resp.contains("ERROR") || resp.contains("?")) {
-                            sendCommand("AT", timeoutMs = 500L)
-                        }
-                        consecutiveErrors = 0
+                // Envia o pulso de vida (Heartbeat) de baixo custo
+                val pulseOk = sendHeartbeatPulse()
+                if (!pulseOk) {
+                    handleHeartbeatFailure("Central ECU parou de responder ao comando de vida a cada 2s.")
+                    break
+                }
 
-                        // Verificação periódica de tensão a cada ~10s
-                        if (System.currentTimeMillis() % 10000 < 2200) {
-                            val voltRaw = sendCommand("AT RV", timeoutMs = 500L)
-                            val parsed = GmDataParsers.parseElmVoltage(voltRaw)
-                            if (parsed != null) {
-                                _batteryVoltage.value = parsed
-                                if (parsed < 10.5f) {
-                                    logTerminal("Aviso de Tensão: ${parsed}V (queda de partida/arranque detectada).")
-                                }
+                // Verificação periódica de tensão a cada ~10s
+                if (System.currentTimeMillis() % 10000 < 2200) {
+                    try {
+                        val voltRaw = sendCommand("AT RV", timeoutMs = 500L)
+                        val parsed = GmDataParsers.parseElmVoltage(voltRaw)
+                        if (parsed != null) {
+                            _batteryVoltage.value = parsed
+                            if (parsed < 10.5f) {
+                                logTerminal("Aviso de Tensão: ${parsed}V (queda de partida/arranque detectada).")
                             }
                         }
-                    } catch (e: Exception) {
-                        consecutiveErrors++
-                        logTerminal("Aviso no keep-alive: ${e.message} (Falhas seguidas: $consecutiveErrors/3)")
-                        if (consecutiveErrors >= 3 && isAutoReconnectOnDropEnabled.value) {
-                            logTerminal("Conexão interrompida (queda de tensão ou reinício do ELM). Iniciando auto-reconexão silenciosa...")
-                            activeDevice?.let { dev ->
-                                launch {
-                                    connectAndHandshake(dev)
-                                }
-                            }
-                            break
-                        }
-                    }
+                    } catch (_: Exception) {}
                 }
             }
         }
@@ -732,6 +936,7 @@ class ObdConnectionEngine(
 
     fun disconnect() {
         keepAliveJob?.cancel()
+        keepAliveJob = null
         try {
             activeSocket?.close()
         } catch (e: Exception) {
@@ -742,6 +947,11 @@ class ObdConnectionEngine(
         _isBluetoothConnected.value = false
         _isPhysicalEcuConnected.value = false
         _isConnected.value = false
+        _heartbeatStatus.value = _heartbeatStatus.value.copy(
+            isAlive = false,
+            statusDescription = "Desconectado"
+        )
+        _elmBenchmark.value = ElmChipBenchmark()
         _scanState.value = ScanState.IDLE
         _statusMessage.value = "Desconectado do adaptador."
         logTerminal("Conexão serial física encerrada.")

@@ -16,7 +16,8 @@ import com.example.model.VehicleProfile
  */
 class EcuFingerprinter(
     private val commandSender: suspend (cmd: String, timeoutMs: Long) -> String,
-    private val logCallback: (String) -> Unit
+    private val logCallback: (String) -> Unit,
+    private val getActiveHeader: () -> String = { "81 11 F1" }
 ) {
     companion object {
         private const val TAG = "EcuFingerprinter"
@@ -44,6 +45,14 @@ class EcuFingerprinter(
             ""
         }
         log("< 09 04 (CalID): $calIdRaw")
+
+        // 1b. CVN - Calibration Verification Number (09 06)
+        val cvnRaw = try {
+            commandSender("09 06", 1500L)
+        } catch (e: Exception) {
+            ""
+        }
+        log("< 09 06 (CVN): $cvnRaw")
 
         // 2. Nome de Broadcast da ECU / Descriptor (09 0A)
         val ecuNameRaw = try {
@@ -131,20 +140,24 @@ class EcuFingerprinter(
         }
 
         // Probe 3: Transmissão Automática Aisin (Target 0x18 na Linha K)
+        val originalHeader = getActiveHeader()
+        val isCan = originalHeader.length <= 4 || originalHeader.startsWith("7E", ignoreCase = true) || originalHeader.length > 8
         var hasAtConfirmed = false
-        try {
-            val atShResp = commandSender("AT SH 81 18 F1", 400L)
-            if (!atShResp.contains("ERROR")) {
-                val atProbe = commandSender("1A 90", 600L)
-                if (atProbe.contains("5A 90") || (atProbe.isNotBlank() && !GmDataParsers.isNegativeResponse(atProbe))) {
-                    hasAtConfirmed = true
-                    log("Sonda física: Câmbio Automático Aisin 50-40LE detectado no barramento K-Line.")
+        if (!isCan) {
+            try {
+                val atShResp = commandSender("AT SH 81 18 F1", 400L)
+                if (!atShResp.contains("ERROR")) {
+                    val atProbe = commandSender("1A 90", 600L)
+                    if (atProbe.contains("5A 90") || (atProbe.isNotBlank() && !GmDataParsers.isNegativeResponse(atProbe))) {
+                        hasAtConfirmed = true
+                        log("Sonda física: Câmbio Automático Aisin 50-40LE detectado no barramento K-Line.")
+                    }
                 }
-                // Restaura o cabeçalho original da injeção primária GM
-                commandSender("AT SH 81 11 F1", 400L)
+            } catch (_: Exception) {
+            } finally {
+                // Restaura fielmente o cabeçalho original ativo negociado
+                try { commandSender("AT SH $originalHeader", 400L) } catch (_: Exception) {}
             }
-        } catch (_: Exception) {
-            try { commandSender("AT SH 81 11 F1", 400L) } catch (_: Exception) {}
         }
 
         // Decodificação e sanitização rigorosa contra NRCs
@@ -173,8 +186,11 @@ class EcuFingerprinter(
             hasDbwConfirmed = hasDbwConfirmed,
             fallbackProfile = VehicleProfile.UNKNOWN
         )
-
-        val matchedProfile = rawMatchedProfile.copy(hasAutomaticTransmission = hasAtConfirmed)
+        val parsedCvn = GmDataParsers.cleanResponse(cvnRaw).replace("49 06", "").trim()
+        val matchedProfile = rawMatchedProfile.copy(
+            hasAutomaticTransmission = hasAtConfirmed,
+            cvn = if (parsedCvn.isNotBlank() && !parsedCvn.contains("ERROR")) parsedCvn else rawMatchedProfile.cvn
+        )
 
         log("Central Mapeada: ${matchedProfile.ecuName} | Motor: ${matchedProfile.engineCode} | Câmbio: ${if (hasAtConfirmed) "Automático Aisin" else "Manual F17/F23"}")
 

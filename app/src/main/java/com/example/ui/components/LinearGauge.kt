@@ -176,7 +176,8 @@ fun DigitalMetricCard(
     unit: String,
     modifier: Modifier = Modifier,
     accentColor: Color = GmAmber,
-    subtitle: String? = null
+    subtitle: String? = null,
+    minMaxIndicator: String? = null
 ) {
     Column(
         modifier = modifier
@@ -229,11 +230,13 @@ fun DigitalMetricCard(
             }
         }
 
-        // Subtítulo ou espaço de reserva para manter o mesmo alinhamento
+        // Subtítulo ou indicador de pico Min/Max da sessão
+        val bottomText = minMaxIndicator ?: subtitle ?: " "
         Text(
-            text = subtitle ?: " ",
-            fontSize = 10.sp,
-            color = if (subtitle != null) TextMuted else Color.Transparent,
+            text = bottomText,
+            fontSize = if (minMaxIndicator != null) 9.sp else 10.sp,
+            fontFamily = if (minMaxIndicator != null) FontFamily.Monospace else FontFamily.Default,
+            color = if (minMaxIndicator != null) AstraCyan.copy(alpha = 0.9f) else if (subtitle != null) TextMuted else Color.Transparent,
             maxLines = 1,
             softWrap = false,
             overflow = TextOverflow.Ellipsis

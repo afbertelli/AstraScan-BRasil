@@ -6,6 +6,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import com.example.model.TelemetrySamplingMode
 import com.example.ui.components.EcuSelectionDialog
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -58,6 +59,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -160,6 +162,11 @@ fun DashboardScreen(
     val isPhysicalEcuConnected by viewModel.isPhysicalEcuConnected.collectAsState()
     val isBluetoothConnected by viewModel.isBluetoothConnected.collectAsState()
     val isManualProfileConfigured by viewModel.isManualProfileConfigured.collectAsState()
+    val heartbeat by viewModel.heartbeatStatus.collectAsState()
+    val isNightHudMode by viewModel.isNightHudMode.collectAsState()
+    val samplingMode by viewModel.samplingMode.collectAsState()
+    val sessionPeaks by viewModel.sessionPeaks.collectAsState()
+    val busHealth by viewModel.busHealth.collectAsState()
 
     var selectedGroup by rememberSaveable { mutableStateOf(CockpitGroup.GERAL) }
     var isEcuSelectorOpen by rememberSaveable { mutableStateOf(false) }
@@ -207,7 +214,7 @@ fun DashboardScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(CarbonDark)
+            .background(if (isNightHudMode) Color(0xFF000000) else CarbonDark)
             .padding(horizontal = 14.dp)
             .testTag("dashboard_screen")
     ) {
@@ -265,6 +272,23 @@ fun DashboardScreen(
                                 fontWeight = FontWeight.Bold,
                                 color = AstraGreen
                             )
+                        }
+                        if (heartbeat.isAlive) {
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(Color(0xFF00381D))
+                                    .padding(horizontal = 4.dp, vertical = 2.dp)
+                            ) {
+                                Text(
+                                    text = "❤️ 2s (${heartbeat.pulseLatencyMs}ms)",
+                                    fontSize = 8.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = AstraGreen
+                                )
+                            }
                         }
                     }
                     Text(
@@ -407,6 +431,164 @@ fun DashboardScreen(
                         maxLines = 1,
                         softWrap = false
                     )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Seletor de Frequência de Amostragem (Modo Puxada 18Hz vs Ciclo Completo)
+            Box(
+                modifier = Modifier
+                    .weight(1.3f)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (samplingMode == TelemetrySamplingMode.HIGH_RATE_FOCUS) AstraCyan.copy(alpha = 0.25f) else CarbonElevated)
+                    .border(1.dp, if (samplingMode == TelemetrySamplingMode.HIGH_RATE_FOCUS) AstraCyan else CarbonBorder, RoundedCornerShape(8.dp))
+                    .clickable {
+                        viewModel.setSamplingMode(
+                            if (samplingMode == TelemetrySamplingMode.HIGH_RATE_FOCUS) TelemetrySamplingMode.FULL_DASHBOARD
+                            else TelemetrySamplingMode.HIGH_RATE_FOCUS
+                        )
+                    }
+                    .padding(horizontal = 8.dp, vertical = 6.dp)
+            ) {
+                Text(
+                    text = if (samplingMode == TelemetrySamplingMode.HIGH_RATE_FOCUS) "⚡ 18Hz (PUXADA)" else "🔄 ~5Hz (COMPLETO)",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = if (samplingMode == TelemetrySamplingMode.HIGH_RATE_FOCUS) AstraCyan else TextSecondary,
+                    maxLines = 1,
+                    softWrap = false
+                )
+            }
+
+            // Alternador de Modo Noturno OLED HUD
+            Box(
+                modifier = Modifier
+                    .weight(0.9f)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(if (isNightHudMode) GmAmber.copy(alpha = 0.25f) else CarbonElevated)
+                    .border(1.dp, if (isNightHudMode) GmAmber else CarbonBorder, RoundedCornerShape(8.dp))
+                    .clickable { viewModel.toggleNightHudMode() }
+                    .padding(horizontal = 8.dp, vertical = 6.dp)
+            ) {
+                Text(
+                    text = if (isNightHudMode) "🌙 HUD ATIVO" else "🔆 MODO HUD",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = if (isNightHudMode) GmAmber else TextSecondary,
+                    maxLines = 1,
+                    softWrap = false
+                )
+            }
+
+            // Botão ZERAR PICOS da Sessão
+            Box(
+                modifier = Modifier
+                    .weight(1.0f)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(CarbonElevated)
+                    .border(1.dp, CarbonBorder, RoundedCornerShape(8.dp))
+                    .clickable { viewModel.resetSessionPeaks() }
+                    .padding(horizontal = 8.dp, vertical = 6.dp)
+            ) {
+                Text(
+                    text = "🔄 ZERAR PICOS",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = AstraCyan,
+                    maxLines = 1,
+                    softWrap = false
+                )
+            }
+        }
+
+        if (isPhysicalEcuConnected) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(CarbonCard)
+                    .border(1.dp, CarbonBorder, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 10.dp, vertical = 5.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(Color(telemetry.engineRegime.badgeColorHex).copy(alpha = 0.2f))
+                        .padding(horizontal = 6.dp, vertical = 2.dp)
+                ) {
+                    Text(
+                        text = "● ${telemetry.engineRegime.label.uppercase()}",
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(telemetry.engineRegime.badgeColorHex)
+                    )
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "Barramento: ${busHealth.healthPercent.toInt()}% [${busHealth.status.take(9)}]",
+                        fontSize = 9.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = if (busHealth.healthPercent >= 90f) AstraGreen else AstraYellow
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "VE: ${String.format(Locale.US, "%.0f", telemetry.volumetricEfficiencyPercent)}%",
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                        color = AstraCyan
+                    )
+                }
+            }
+        }
+
+        // Alerta Crítico com Vibração (Superaquecimento ECT >= 105°C ou Bateria em Falha)
+        val isOverheat = isPhysicalEcuConnected && telemetry.coolantTempC >= 105f
+        val isBatteryLow = isPhysicalEcuConnected && telemetry.rpm > 350f && telemetry.ecuBatteryVoltage in 1f..11.6f
+        val isBatteryOver = isPhysicalEcuConnected && telemetry.ecuBatteryVoltage >= 15.2f
+
+        if (isOverheat || isBatteryLow || isBatteryOver) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Color(0xFF450A0A))
+                    .border(1.dp, AstraRedline, RoundedCornerShape(10.dp))
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(text = "🚨", fontSize = 16.sp)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Column {
+                        val alertTitle = when {
+                            isOverheat -> "ALERTA DE SUPERAQUECIMENTO: ${telemetry.coolantTempC.toInt()}°C!"
+                            isBatteryLow -> "ALERTA: TENSÃO DA BATERIA CRÍTICA (${String.format(Locale.US, "%.1f", telemetry.ecuBatteryVoltage)}V)!"
+                            else -> "ALERTA: SOBRETENSÃO NO REGULADOR (${String.format(Locale.US, "%.1f", telemetry.ecuBatteryVoltage)}V)!"
+                        }
+                        Text(
+                            text = alertTitle,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = AstraRedline
+                        )
+                        Text(
+                            text = "Aviso vibratório emitido. Verifique o compartimento do motor.",
+                            fontSize = 10.sp,
+                            color = TextSecondary
+                        )
+                    }
                 }
             }
         }
@@ -776,6 +958,34 @@ fun DashboardScreen(
                             modifier = Modifier.weight(1f),
                             accentColor = AstraGreen,
                             subtitle = if (!isConnected) "Desconectado" else if (telemetry.speedKmh > 3f) "Em movimento" else "Em marcha lenta"
+                        )
+                    }
+                }
+
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        DigitalMetricCard(
+                            title = "Eficiência Volumétrica",
+                            value = if (isConnected) String.format(Locale.US, "%.1f", telemetry.volumetricEfficiencyPercent) else "0.0",
+                            unit = "%",
+                            modifier = Modifier.weight(1f),
+                            accentColor = AstraCyan,
+                            subtitle = "Respiração do Motor",
+                            minMaxIndicator = if (sessionPeaks.hasValidPeaks()) "Pico: ${String.format(Locale.US, "%.0f", sessionPeaks.maxVePercent)}%" else null
+                        )
+
+                        val effVolt = if (telemetry.ecuBatteryVoltage > 5f) telemetry.ecuBatteryVoltage else telemetry.elmBatteryVoltage
+                        DigitalMetricCard(
+                            title = "Tensão Alternador / Bateria",
+                            value = if (isConnected) String.format(Locale.US, "%.1f", effVolt) else "0.0",
+                            unit = "V",
+                            modifier = Modifier.weight(1f),
+                            accentColor = if (effVolt in 13.5f..14.8f) AstraGreen else AstraYellow,
+                            subtitle = if (effVolt in 13.5f..14.8f) "Alternador Normal" else "Bateria / Repouso",
+                            minMaxIndicator = if (sessionPeaks.hasValidPeaks()) "Mín: ${String.format(Locale.US, "%.1f", sessionPeaks.minVolt)} | Máx: ${String.format(Locale.US, "%.1f", sessionPeaks.maxVolt)}" else null
                         )
                     }
                 }

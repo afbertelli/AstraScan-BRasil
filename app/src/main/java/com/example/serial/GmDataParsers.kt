@@ -317,6 +317,35 @@ object GmDataParsers {
     }
 
     /**
+     * Calcula a Eficiência Volumétrica (VE %) estimada em tempo real para os motores GM Família II (8V e 16V).
+     * Cruza a pressão no coletor (MAP), barômetro, temperatura de ar (IAT) e curva de respiração mecânica do comando.
+     */
+    fun calculateVolumetricEfficiency(
+        rpm: Float,
+        mapKpa: Float,
+        baroKpa: Float = 101.3f,
+        iatC: Float = 25.0f,
+        is16V: Boolean = false
+    ): Float {
+        if (rpm.isNaN() || mapKpa.isNaN() || rpm < 350f || mapKpa <= 0f) return 0f
+        val effectiveBaro = if (baroKpa > 50f) baroKpa else 101.3f
+        val pressureRatio = (mapKpa / effectiveBaro).coerceIn(0.10f, 1.10f)
+
+        // Fator de respiração mecânica conforme perfil de comando de válvulas (8V SOHC vs 16V DOHC)
+        val peakRpm = if (is16V) 4000f else 3000f
+        val rpmDeviation = Math.abs(rpm - peakRpm)
+        val camBreathingFactor = (1.0f - (rpmDeviation / 5000f).coerceIn(0f, 0.28f))
+
+        // Densidade do ar pela temperatura admitida (compensação térmica IAT)
+        val tempKelvin = (iatC + 273.15f).coerceIn(240f, 350f)
+        val thermalDensityFactor = (298.15f / tempKelvin).coerceIn(0.85f, 1.15f)
+
+        val maxTheoreticalVe = if (is16V) 92.0f else 86.0f
+        val calculatedVe = maxTheoreticalVe * pressureRatio * camBreathingFactor * thermalDensityFactor
+        return calculatedVe.coerceIn(0f, 105f)
+    }
+
+    /**
      * Abertura da Borboleta (TPS %): 01 11 -> (A * 100) / 255 %
      */
     fun parseTpsPercent(raw: String): Float? {
@@ -693,6 +722,50 @@ object GmDataParsers {
         val digit4 = byte2 and 0x0F
 
         return String.format(Locale.US, "%s%d%X%X%X", prefix, digit1, digit2, digit3, digit4)
+    }
+
+    /**
+     * Decodifica lista de DTCs a partir de fluxo de bytes brutos do Modo 03 (43h) ou Modo 07 (47h).
+     * Suporta tanto o formato direto SAE J1979 (43 [DTC1_H] [DTC1_L]...) quanto o formato com contador (43 [num] [DTC1_H] [DTC1_L]...).
+     */
+    fun parseDtcBytes(bytes: List<Int>, expectedModeAck: Int, isPresent: Boolean = true): List<DtcCode> {
+        if (bytes.size < 3 || bytes[0] != expectedModeAck) return emptyList()
+
+        val codes = mutableListOf<DtcCode>()
+        val seenCodes = mutableSetOf<String>()
+
+        // Testa se o frame possui byte de contagem (ex: 43 01 01 05 -> tamanho par e bytes[1] == (bytes.size-2)/2)
+        val hasCountByte = bytes.size % 2 == 0 && bytes[1] in 1..8 && (bytes[1] * 2 + 2 <= bytes.size)
+        val startIndex = if (hasCountByte) 2 else 1
+
+        var i = startIndex
+        while (i + 1 < bytes.size) {
+            val b1 = bytes[i]
+            val b2 = bytes[i + 1]
+            val codeStr = decodeDtc(b1, b2)
+            if (codeStr != null && codeStr != "P0000" && !seenCodes.contains(codeStr)) {
+                seenCodes.add(codeStr)
+                codes.add(mapDtcDetails(codeStr, isPresent = isPresent))
+            }
+            i += 2
+        }
+
+        // Se começar no startIndex não encontrou nada mas o tamanho é par, tenta o fallback pelo outro índice
+        if (codes.isEmpty() && startIndex == 2 && bytes.size >= 3) {
+            var j = 1
+            while (j + 1 < bytes.size) {
+                val b1 = bytes[j]
+                val b2 = bytes[j + 1]
+                val codeStr = decodeDtc(b1, b2)
+                if (codeStr != null && codeStr != "P0000" && !seenCodes.contains(codeStr)) {
+                    seenCodes.add(codeStr)
+                    codes.add(mapDtcDetails(codeStr, isPresent = isPresent))
+                }
+                j += 2
+            }
+        }
+
+        return codes
     }
 
     /**
@@ -1499,7 +1572,7 @@ object GmDataParsers {
             if (combined.contains("BOSCH") || combined.contains("0261")) {
                 return VehicleProfile.ASTRA_20_8V_ME796.copy(vin = vin)
             }
-            if (vin.length == 17 && (vin[9] in '9'..'B')) {
+            if (vin.length == 17 && (vin[9] in charArrayOf('9', 'A', 'B'))) {
                 return VehicleProfile.ASTRA_20_8V_FLEX_FASE2.copy(vin = vin)
             }
             return VehicleProfile.ASTRA_20_8V_FLEX_FASE1.copy(vin = vin)
@@ -1527,7 +1600,7 @@ object GmDataParsers {
         }
 
         // Se o VIN indicar ano entre 2009 e 2011:
-        if (vin.length == 17 && (vin[9] in '9'..'B')) {
+        if (vin.length == 17 && (vin[9] in charArrayOf('9', 'A', 'B'))) {
             if (combined.contains("ROCAMBOLE") || combined.contains("ME7.9.9") || combined.contains("ME799")) {
                 return VehicleProfile.ASTRA_20_8V_ME799.copy(
                     gmPartNumber = if (partNumber.isNotBlank()) partNumber else "94703803",

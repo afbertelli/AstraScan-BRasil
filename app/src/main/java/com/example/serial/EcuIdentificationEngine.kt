@@ -1,10 +1,14 @@
 package com.example.serial
 
 import android.util.Log
+import com.example.model.CommunicationBusHealth
 import com.example.model.DtcCode
 import com.example.model.EcuSensorProfile
+import com.example.model.EngineOperatingRegime
 import com.example.model.LiveTelemetry
 import com.example.model.ScanState
+import com.example.model.SessionSensorPeaks
+import com.example.model.TelemetrySamplingMode
 import com.example.model.VehicleProfile
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -32,13 +36,14 @@ class EcuIdentificationEngine(
     private val scope: CoroutineScope,
     private val commandSender: suspend (cmd: String, timeoutMs: Long) -> String,
     private val logCallback: (String) -> Unit,
-    private val onPhysicalConnectionChanged: (Boolean) -> Unit = {}
+    private val onPhysicalConnectionChanged: (Boolean) -> Unit = {},
+    private val getActiveHeader: () -> String = { "81 11 F1" }
 ) {
     companion object {
         private const val TAG = "EcuIdentificationEngine"
     }
 
-    private val fingerprinter = EcuFingerprinter(commandSender, logCallback)
+    private val fingerprinter = EcuFingerprinter(commandSender, logCallback, getActiveHeader)
 
     private val _vehicleProfile = MutableStateFlow(VehicleProfile.UNKNOWN)
     val vehicleProfile: StateFlow<VehicleProfile> = _vehicleProfile.asStateFlow()
@@ -59,6 +64,35 @@ class EcuIdentificationEngine(
     val historyDtcs: StateFlow<List<DtcCode>> = _historyDtcs.asStateFlow()
 
     val isTelemetryPaused = MutableStateFlow(false)
+    val samplingMode = MutableStateFlow(TelemetrySamplingMode.FULL_DASHBOARD)
+
+    private val _busHealth = MutableStateFlow(CommunicationBusHealth())
+    val busHealth: StateFlow<CommunicationBusHealth> = _busHealth.asStateFlow()
+
+    private val _sessionPeaks = MutableStateFlow(SessionSensorPeaks())
+    val sessionPeaks: StateFlow<SessionSensorPeaks> = _sessionPeaks.asStateFlow()
+
+    fun resetSessionPeaks() {
+        val curr = _telemetry.value
+        val effVolt = if (curr.ecuBatteryVoltage > 5f) curr.ecuBatteryVoltage else curr.elmBatteryVoltage
+        _sessionPeaks.value = SessionSensorPeaks(
+            minRpm = curr.rpm,
+            maxRpm = curr.rpm,
+            minMap = curr.mapKpa,
+            maxMap = curr.mapKpa,
+            minEct = curr.coolantTempC,
+            maxEct = curr.coolantTempC,
+            minVolt = effVolt,
+            maxVolt = effVolt,
+            minTps = curr.throttlePercent,
+            maxTps = curr.throttlePercent,
+            minLambda = curr.lambdaVoltage,
+            maxLambda = curr.lambdaVoltage,
+            maxVePercent = curr.volumetricEfficiencyPercent,
+            sampleCount = if (curr.rpm > 350f) 1L else 0L
+        )
+        log("Picos e extremos da sessão zerados pelo usuário.")
+    }
 
     fun pauseTelemetry() {
         isTelemetryPaused.value = true
@@ -129,6 +163,44 @@ class EcuIdentificationEngine(
             val lambdaWindow = mutableListOf<Float>()
             var consecutiveNoSerial = 0
             var lastEcuPhysicalDataMs = System.currentTimeMillis()
+
+            var totalCommands = 0L
+            var successfulFrames = 0L
+            var invalidFrames = 0L
+
+            suspend fun sendTracked(cmd: String, timeoutMs: Long): String {
+                totalCommands++
+                val resp = try { commandSender(cmd, timeoutMs) } catch (_: Exception) { "" }
+                if (resp.isNotBlank() && !GmDataParsers.isNegativeResponse(resp)) {
+                    successfulFrames++
+                } else {
+                    invalidFrames++
+                }
+                return resp
+            }
+
+            val ectRingBuffer = mutableListOf<Float>()
+            val mapRingBuffer = mutableListOf<Float>()
+            val tpsRingBuffer = mutableListOf<Float>()
+            val voltRingBuffer = mutableListOf<Float>()
+
+            fun filterSpike(buffer: MutableList<Float>, value: Float, maxJump: Float): Float {
+                if (buffer.isEmpty()) {
+                    buffer.add(value)
+                    return value
+                }
+                val last = buffer.last()
+                if (Math.abs(value - last) > maxJump && buffer.size >= 2) {
+                    buffer.add(last)
+                    if (buffer.size > 3) buffer.removeAt(0)
+                    return last
+                }
+                buffer.add(value)
+                if (buffer.size > 3) buffer.removeAt(0)
+                val sorted = buffer.sorted()
+                return sorted[sorted.size / 2]
+            }
+
             log("Loop de telemetria em tempo real ativado para perfil: ${profile.engineCode}")
 
             while (isActive) {
@@ -246,7 +318,7 @@ class EcuIdentificationEngine(
                     }
 
                     // ========================================================
-                    // 2. PRIMARY FAST SENSORS (ROTAÇÃO RÁPIDA: TPS, MAP, VEL, PONTO, LAMBDA)
+                    // 2. PRIMARY SENSORS (MODO FOCO ALTA RESOLUÇÃO OU VARREDURA PADRÃO)
                     // ========================================================
                     var spd = current.speedKmh
                     var map = current.mapKpa
@@ -254,62 +326,82 @@ class EcuIdentificationEngine(
                     var spark = current.sparkAdvanceDeg
                     var lambda = current.lambdaVoltage
 
-                    when (cycleCounter % 4) {
-                        0 -> {
-                            // Borboleta (TPS %)
-                            if (!unsupportedPids.contains("01 11")) {
-                                val tpsRaw = try { commandSender("01 11", 500L) } catch (_: Exception) { "" }
-                                val parsedTps = GmDataParsers.parseTpsPercent(tpsRaw)
-                                if (parsedTps != null) {
-                                    tps = parsedTps
-                                } else if (GmDataParsers.isNegativeResponse(tpsRaw)) {
-                                    unsupportedPids.add("01 11")
-                                }
-                            }
-                        }
-                        1 -> {
-                            // Pressão no Coletor (MAP kPa)
+                    val isHighRate = samplingMode.value == TelemetrySamplingMode.HIGH_RATE_FOCUS
+
+                    if (isHighRate) {
+                        // MODO PUXADA / ALTA RESOLUÇÃO: Foco estrito em RPM + MAP e TPS alternados (~18 Hz)
+                        if (cycleCounter % 2 == 0) {
                             if (!unsupportedPids.contains("01 0B")) {
-                                val mapRaw = try { commandSender("01 0B", 500L) } catch (_: Exception) { "" }
-                                var parsedMap = GmDataParsers.parseMap(mapRaw)
-                                if (parsedMap == null && isMode21Supported == true && !unsupportedPids.contains("21 0A")) {
-                                    val map21 = try { commandSender("21 0A", 400L) } catch (_: Exception) { "" }
-                                    parsedMap = GmDataParsers.parseMap(map21)
-                                }
-                                if (parsedMap != null) {
-                                    map = parsedMap
-                                } else if (GmDataParsers.isNegativeResponse(mapRaw)) {
-                                    unsupportedPids.add("01 0B")
-                                }
+                                val mapRaw = try { commandSender("01 0B", 400L) } catch (_: Exception) { "" }
+                                val parsedMap = GmDataParsers.parseMap(mapRaw)
+                                if (parsedMap != null) map = parsedMap
+                            }
+                        } else {
+                            if (!unsupportedPids.contains("01 11")) {
+                                val tpsRaw = try { commandSender("01 11", 400L) } catch (_: Exception) { "" }
+                                val parsedTps = GmDataParsers.parseTpsPercent(tpsRaw)
+                                if (parsedTps != null) tps = parsedTps
                             }
                         }
-                        2 -> {
-                            // Velocidade do Veículo (km/h)
-                            if (!unsupportedPids.contains("01 0D")) {
-                                val spdRaw = try { commandSender("01 0D", 500L) } catch (_: Exception) { "" }
-                                val parsedSpd = GmDataParsers.parseSpeed(spdRaw)
-                                if (parsedSpd != null) {
-                                    spd = parsedSpd
-                                } else if (GmDataParsers.isNegativeResponse(spdRaw)) {
-                                    unsupportedPids.add("01 0D")
+                    } else {
+                        // MODO PADRÃO: Rotação em 4 passos dos sensores dinâmicos
+                        when (cycleCounter % 4) {
+                            0 -> {
+                                // Borboleta (TPS %)
+                                if (!unsupportedPids.contains("01 11")) {
+                                    val tpsRaw = try { commandSender("01 11", 500L) } catch (_: Exception) { "" }
+                                    val parsedTps = GmDataParsers.parseTpsPercent(tpsRaw)
+                                    if (parsedTps != null) {
+                                        tps = parsedTps
+                                    } else if (GmDataParsers.isNegativeResponse(tpsRaw)) {
+                                        unsupportedPids.add("01 11")
+                                    }
                                 }
                             }
-                        }
-                        3 -> {
-                            // Avanço de Ignição e Sonda Lambda 1
-                            if (!unsupportedPids.contains("01 0E")) {
-                                val sparkRaw = try { commandSender("01 0E", 500L) } catch (_: Exception) { "" }
-                                val parsedSpark = GmDataParsers.parseSparkAdvance(sparkRaw)
-                                if (parsedSpark != null) spark = parsedSpark
+                            1 -> {
+                                // Pressão no Coletor (MAP kPa)
+                                if (!unsupportedPids.contains("01 0B")) {
+                                    val mapRaw = try { commandSender("01 0B", 500L) } catch (_: Exception) { "" }
+                                    var parsedMap = GmDataParsers.parseMap(mapRaw)
+                                    if (parsedMap == null && isMode21Supported == true && !unsupportedPids.contains("21 0A")) {
+                                        val map21 = try { commandSender("21 0A", 400L) } catch (_: Exception) { "" }
+                                        parsedMap = GmDataParsers.parseMap(map21)
+                                    }
+                                    if (parsedMap != null) {
+                                        map = parsedMap
+                                    } else if (GmDataParsers.isNegativeResponse(mapRaw)) {
+                                        unsupportedPids.add("01 0B")
+                                    }
+                                }
                             }
-                            if (!unsupportedPids.contains("01 14")) {
-                                val lambdaRaw = try { commandSender("01 14", 500L) } catch (_: Exception) { "" }
-                                val parsedLambda = GmDataParsers.parseLambdaVoltage(lambdaRaw)
-                                if (parsedLambda != null) {
-                                    lambda = parsedLambda
-                                    lambdaWindow.add(parsedLambda)
-                                    if (lambdaWindow.size > 30) {
-                                        lambdaWindow.removeAt(0)
+                            2 -> {
+                                // Velocidade do Veículo (km/h)
+                                if (!unsupportedPids.contains("01 0D")) {
+                                    val spdRaw = try { commandSender("01 0D", 500L) } catch (_: Exception) { "" }
+                                    val parsedSpd = GmDataParsers.parseSpeed(spdRaw)
+                                    if (parsedSpd != null) {
+                                        spd = parsedSpd
+                                    } else if (GmDataParsers.isNegativeResponse(spdRaw)) {
+                                        unsupportedPids.add("01 0D")
+                                    }
+                                }
+                            }
+                            3 -> {
+                                // Avanço de Ignição e Sonda Lambda 1
+                                if (!unsupportedPids.contains("01 0E")) {
+                                    val sparkRaw = try { commandSender("01 0E", 500L) } catch (_: Exception) { "" }
+                                    val parsedSpark = GmDataParsers.parseSparkAdvance(sparkRaw)
+                                    if (parsedSpark != null) spark = parsedSpark
+                                }
+                                if (!unsupportedPids.contains("01 14")) {
+                                    val lambdaRaw = try { commandSender("01 14", 500L) } catch (_: Exception) { "" }
+                                    val parsedLambda = GmDataParsers.parseLambdaVoltage(lambdaRaw)
+                                    if (parsedLambda != null) {
+                                        lambda = parsedLambda
+                                        lambdaWindow.add(parsedLambda)
+                                        if (lambdaWindow.size > 30) {
+                                            lambdaWindow.removeAt(0)
+                                        }
                                     }
                                 }
                             }
@@ -317,7 +409,7 @@ class EcuIdentificationEngine(
                     }
 
                     // ========================================================
-                    // 3. SECONDARY SLOW SENSORS (ROTAÇÃO EM 8 PASSOS)
+                    // 3. SECONDARY SLOW SENSORS (ROTAÇÃO EM 8 PASSOS - APENAS MODO PADRÃO)
                     // ========================================================
                     var ect = current.coolantTempC
                     var iat = current.intakeAirTempC
@@ -341,7 +433,8 @@ class EcuIdentificationEngine(
                     var knockGlobal = current.knockRetardDeg
                     var ti: Float? = current.injectionTimeMs
 
-                    when (cycleCounter % 8) {
+                    if (!isHighRate) {
+                        when (cycleCounter % 8) {
                         0 -> {
                             // Temperatura da Água (ECT)
                             if (!unsupportedPids.contains("01 05")) {
@@ -472,6 +565,7 @@ class EcuIdentificationEngine(
                             tpsVolt2 = (4.5f - (tps * 0.045f))
                         }
                     }
+                }
 
                     cycleCounter++
 
@@ -483,9 +577,15 @@ class EcuIdentificationEngine(
                     val lPerHour = GmDataParsers.calculateLitersPerHour(actualTi, rpm, activeProfile.injectorFlowCcMin)
                     val kmPerL = GmDataParsers.calculateKmPerLiter(spd, lPerHour)
                     val maf = GmDataParsers.estimateSpeedDensityMaf(rpm, map, iat, activeProfile.displacementLiters)
+                    val is16V = activeProfile.valveCount.contains("16")
+                    val ve = GmDataParsers.calculateVolumetricEfficiency(rpm, map, effectiveBaro, iat, is16V)
 
                     val (lambdaHz, lambdaStatus) = GmDataParsers.evaluateLambdaOscillation(lambdaWindow)
                     val (trimLevel, trimTitle, trimAdvice) = GmDataParsers.evaluateFuelTrimHealth(stft, ltft)
+
+                    val currentRegime = AstraIdleHealthChecker.detectOperatingRegime(
+                        current.copy(rpm = rpm, coolantTempC = ect, throttlePercent = tps, mapKpa = map)
+                    )
 
                     current = LiveTelemetry(
                         rpm = rpm,
@@ -533,11 +633,54 @@ class EcuIdentificationEngine(
                         fuelPumpRelayStatus = (rpm > 100f || _isInjectionDetected.value),
                         sampleRateHz = ((1000f / (System.currentTimeMillis() - loopStartMs).coerceAtLeast(1))).coerceIn(0.5f, 30.0f),
                         loopLatencyMs = (System.currentTimeMillis() - loopStartMs).toInt().coerceAtLeast(1),
+                        volumetricEfficiencyPercent = ve,
+                        engineRegime = currentRegime,
                         timestampMs = System.currentTimeMillis()
                     )
 
                     // Emissão imediata e fluida para a UI em tempo real
                     _telemetry.value = current
+
+                    // Atualiza picos e extremos dinâmicos registrados durante a sessão
+                    if (rpm > 350f) {
+                        val p = _sessionPeaks.value
+                        val effVolt = if (ecuVolt > 5f) ecuVolt else elmVolt
+                        _sessionPeaks.value = SessionSensorPeaks(
+                            minRpm = if (p.sampleCount == 0L || rpm < p.minRpm) rpm else p.minRpm,
+                            maxRpm = if (rpm > p.maxRpm) rpm else p.maxRpm,
+                            minMap = if (p.sampleCount == 0L || (map > 5f && map < p.minMap)) map else p.minMap,
+                            maxMap = if (map > p.maxMap) map else p.maxMap,
+                            minEct = if (p.sampleCount == 0L || (ect > 0f && ect < p.minEct)) ect else p.minEct,
+                            maxEct = if (ect > p.maxEct) ect else p.maxEct,
+                            minVolt = if (p.sampleCount == 0L || (effVolt > 5f && effVolt < p.minVolt)) effVolt else p.minVolt,
+                            maxVolt = if (effVolt > p.maxVolt) effVolt else p.maxVolt,
+                            minTps = if (p.sampleCount == 0L || tps < p.minTps) tps else p.minTps,
+                            maxTps = if (tps > p.maxTps) tps else p.maxTps,
+                            minLambda = if (p.sampleCount == 0L || (lambda > 0f && lambda < p.minLambda)) lambda else p.minLambda,
+                            maxLambda = if (lambda > p.maxLambda) lambda else p.maxLambda,
+                            maxVePercent = if (ve > p.maxVePercent) ve else p.maxVePercent,
+                            sampleCount = p.sampleCount + 1L
+                        )
+                    }
+
+                    // Atualiza auditoria de integridade do barramento a cada 8 ciclos
+                    if (cycleCounter % 8 == 0 && totalCommands > 0L) {
+                        val pct = (successfulFrames.toFloat() / totalCommands.toFloat()) * 100f
+                        val status = when {
+                            pct >= 95f -> "Excelente (95%+)"
+                            pct >= 85f -> "Estável (${pct.toInt()}%)"
+                            pct >= 70f -> "Atenção (${pct.toInt()}%)"
+                            else -> "Ruído Elevado (${pct.toInt()}%)"
+                        }
+                        _busHealth.value = CommunicationBusHealth(
+                            totalRequests = totalCommands,
+                            successfulFrames = successfulFrames,
+                            invalidOrTimeoutFrames = invalidFrames,
+                            healthPercent = pct,
+                            averageLatencyMs = (System.currentTimeMillis() - loopStartMs).coerceAtLeast(1),
+                            status = status
+                        )
+                    }
                     delay(20)
                 } catch (e: Exception) {
                     log("Aviso no loop de telemetria: ${e.message}")
@@ -557,40 +700,11 @@ class EcuIdentificationEngine(
             log("< 03 DTCs Ativos: $resp03")
 
             val bytes = GmDataParsers.extractHexBytes(resp03)
-            val codes = mutableListOf<DtcCode>()
-
-            if (bytes.size >= 2 && bytes[0] == 0x43) {
-                val numDtc = bytes[1]
-                var i = 2
-                while (i + 1 < bytes.size && codes.size < numDtc) {
-                    val b1 = bytes[i]
-                    val b2 = bytes[i + 1]
-                    val codeStr = GmDataParsers.decodeDtc(b1, b2)
-                    if (codeStr != null && codeStr != "P0000") {
-                        val dtc = GmDataParsers.mapDtcDetails(codeStr, isPresent = true)
-                        codes.add(dtc)
-                    }
-                    i += 2
-                }
-            }
+            val codes = GmDataParsers.parseDtcBytes(bytes, expectedModeAck = 0x43, isPresent = true).toMutableList()
 
             val resp07 = commandSender("07", 2500L)
             val histBytes = GmDataParsers.extractHexBytes(resp07)
-            val histCodes = mutableListOf<DtcCode>()
-            if (histBytes.size >= 2 && histBytes[0] == 0x47) {
-                val numDtc = histBytes[1]
-                var i = 2
-                while (i + 1 < histBytes.size && histCodes.size < numDtc) {
-                    val b1 = histBytes[i]
-                    val b2 = histBytes[i + 1]
-                    val codeStr = GmDataParsers.decodeDtc(b1, b2)
-                    if (codeStr != null && codeStr != "P0000") {
-                        val dtc = GmDataParsers.mapDtcDetails(codeStr, isPresent = false)
-                        histCodes.add(dtc)
-                    }
-                    i += 2
-                }
-            }
+            val histCodes = GmDataParsers.parseDtcBytes(histBytes, expectedModeAck = 0x47, isPresent = false)
 
             // Se a leitura padrão 03/07 não retornou códigos, tenta o comando KWP nativo GM (18 00 FF 00)
             if (codes.isEmpty()) {

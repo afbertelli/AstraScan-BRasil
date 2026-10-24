@@ -9,17 +9,23 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.os.Build
 import android.os.IBinder
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.ai.AiDiagnosticEngine
 import com.example.ai.AiDiagnosticReport
 import com.example.ai.ComponentAudit
+import com.example.model.CommunicationBusHealth
 import com.example.model.DtcCode
 import com.example.model.EcuSensorProfile
+import com.example.model.ElmChipBenchmark
+import com.example.model.HeartbeatStatus
 import com.example.model.LiveTelemetry
 import com.example.model.ProtocolType
 import com.example.model.ScanState
+import com.example.model.SessionSensorPeaks
+import com.example.model.TelemetrySamplingMode
 import com.example.model.VehicleProfile
 import com.example.serial.AutoScannerManager
 import com.example.service.TelemetryForegroundService
@@ -56,6 +62,18 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     val isPhysicalEcuConnected: StateFlow<Boolean> get() = diagnosisViewModel.isPhysicalEcuConnected
     val isBluetoothConnected: StateFlow<Boolean> get() = diagnosisViewModel.isBluetoothConnected
     val isManualProfileConfigured: StateFlow<Boolean> get() = diagnosisViewModel.isManualProfileConfigured
+    val heartbeatStatus: StateFlow<HeartbeatStatus> get() = diagnosisViewModel.heartbeatStatus
+    val elmBenchmark: StateFlow<ElmChipBenchmark> get() = diagnosisViewModel.elmBenchmark
+    val samplingMode: MutableStateFlow<TelemetrySamplingMode> get() = diagnosisViewModel.samplingMode
+    val batteryVoltage: StateFlow<Float> get() = diagnosisViewModel.batteryVoltage
+    val busHealth: StateFlow<CommunicationBusHealth> get() = diagnosisViewModel.busHealth
+    val sessionPeaks: StateFlow<SessionSensorPeaks> get() = diagnosisViewModel.sessionPeaks
+    fun resetSessionPeaks() { diagnosisViewModel.resetSessionPeaks() }
+
+    val isNightHudMode = MutableStateFlow(false)
+    fun toggleNightHudMode() { isNightHudMode.value = !isNightHudMode.value }
+    fun setSamplingMode(mode: TelemetrySamplingMode) { diagnosisViewModel.setSamplingMode(mode) }
+    fun generateTechnicalReport(): String = diagnosisViewModel.generateTechnicalReport()
 
     private val _currentScreen = MutableStateFlow(AppScreen.CONNECTION)
     val currentScreen: StateFlow<AppScreen> = _currentScreen.asStateFlow()
@@ -231,17 +249,62 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             sessionBuffer.add(telemetry)
         }
 
-        telemetryService?.logSample(telemetry)
+        checkAndTriggerCriticalAlert(telemetry, batteryVoltage.value)
 
         if (_isRecordingDatalogger.value && activeFileWriter != null) {
             try {
                 val csvLine = formatTelemetryCsvLine(telemetry)
                 activeFileWriter?.write(csvLine)
                 activeFileWriter?.flush()
-                _recordedDataloggerCount.value = _recordedDataloggerCount.value + 1
+                val newCount = _recordedDataloggerCount.value + 1
+                _recordedDataloggerCount.value = newCount
+                telemetryService?.updateSampleCount(newCount, telemetry.rpm)
             } catch (e: Exception) {
                 e.printStackTrace()
             }
+        }
+    }
+
+    private var lastHapticAlertMs = 0L
+
+    fun checkAndTriggerCriticalAlert(telemetry: LiveTelemetry, batteryVolt: Float) {
+        val isEngineRunning = telemetry.rpm > 350f
+        val isOverheat = telemetry.coolantTempC >= 105f
+        val isBatteryCritical = (batteryVolt in 1.0f..11.6f && isEngineRunning) || batteryVolt >= 15.2f
+
+        if (isOverheat || isBatteryCritical) {
+            val now = System.currentTimeMillis()
+            if (now - lastHapticAlertMs >= 10000L) {
+                lastHapticAlertMs = now
+                triggerHapticFeedback()
+            }
+        }
+    }
+
+    private fun triggerHapticFeedback() {
+        try {
+            val app = getApplication<Application>()
+            val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val vm = app.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? android.os.VibratorManager
+                vm?.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                app.getSystemService(Context.VIBRATOR_SERVICE) as? android.os.Vibrator
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator?.vibrate(
+                    android.os.VibrationEffect.createWaveform(
+                        longArrayOf(0, 150, 100, 250),
+                        -1
+                    )
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(300L)
+            }
+        } catch (_: Throwable) {
+            // Ignora se hardware não possuir motor de vibração ou em teste JVM
         }
     }
 
@@ -345,7 +408,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             _lastExportedFilePath.value = file.absolutePath
             _exportMessage.value = "Gravação iniciada: ${file.name}"
 
-            telemetryService?.startLoggingSession()
+            telemetryService?.startLoggingSession(file.name)
         } catch (e: Exception) {
             _exportMessage.value = "Erro ao iniciar gravação: ${e.message}"
             e.printStackTrace()

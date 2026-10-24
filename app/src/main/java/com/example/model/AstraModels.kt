@@ -72,6 +72,7 @@ data class VehicleProfile(
     val hardwareNumber: String = "",
     val softwareVersion: String = "",
     val calId: String = "",
+    val cvn: String = "",
     val vin: String = "",
     val supportsFlexPids: Boolean = false,
     val redlineRpm: Float = 6400f,
@@ -441,6 +442,12 @@ data class LiveTelemetry(
     val sampleRateHz: Float = 0f,
     val loopLatencyMs: Int = 0,
 
+    // 12. EFICIÊNCIA VOLUMÉTRICA & REGIME OPERACIONAL DINÂMICO
+    val volumetricEfficiencyPercent: Float = 0f,
+    val engineRegime: EngineOperatingRegime = EngineOperatingRegime.OFF,
+    val lambdaCrossCountPerSec: Float = 0f,
+    val lambdaTransitionTimeMs: Int = 0,
+
     val timestampMs: Long = System.currentTimeMillis()
 )
 
@@ -502,3 +509,94 @@ data class EcuSensorProfile(
     val fastPollingCommands: List<String>,
     val slowPollingCommands: List<String>
 )
+
+/**
+ * Estado e métricas do Heartbeat (Verificação de Vida a cada 2 segundos)
+ */
+data class HeartbeatStatus(
+    val isAlive: Boolean = false,
+    val lastPulseTimestamp: Long = 0L,
+    val pulseLatencyMs: Long = 0L,
+    val totalPulsesSent: Int = 0,
+    val consecutiveFailures: Int = 0,
+    val lastCommandSent: String = "",
+    val lastResponse: String = "",
+    val statusDescription: String = "Inativo"
+)
+
+/**
+ * Níveis de qualidade e autenticidade do chipset do adaptador ELM327 OBD-II
+ */
+enum class ElmQualityTier(val label: String, val badgeColorHex: Long) {
+    UNKNOWN("Aguardando Análise", 0xFF888888),
+    EXCELLENT_PIC18F("Original PIC18F25K80 (v1.5/v1.4)", 0xFF00E676),
+    GOOD_COMPATIBLE("Compatível Estável (v1.5)", 0xFF00B0FF),
+    QUESTIONABLE_CLONE("Clone v2.1 de Baixo Custo", 0xFFFF9100),
+    UNSTABLE("Instável / Sem Linha K Real", 0xFFFF1744)
+}
+
+/**
+ * Benchmark e auditoria de hardware do adaptador ELM327 conectado
+ */
+data class ElmChipBenchmark(
+    val versionString: String = "ELM327",
+    val deviceDescription: String = "",
+    val qualityTier: ElmQualityTier = ElmQualityTier.UNKNOWN,
+    val isKLineCertified: Boolean = true,
+    val latencyMs: Long = 0L,
+    val recommendationText: String = "Adaptador pronto para conexão."
+)
+
+/**
+ * Modo de frequência e foco de amostragem da telemetria
+ */
+enum class TelemetrySamplingMode(val label: String, val description: String) {
+    FULL_DASHBOARD("Varredura Completa", "Todos os sensores monitorados (~5 Hz)"),
+    HIGH_RATE_FOCUS("Alta Resolução (Puxada)", "Foco em RPM + MAP + TPS (~18 Hz)")
+}
+
+/**
+ * Regime de operação física do motor GM Astra detectado em tempo real
+ */
+enum class EngineOperatingRegime(val label: String, val badgeColorHex: Long) {
+    OFF("Motor Parado (Chave Ligada)", 0xFF9E9E9E),
+    COLD_START("Fase Fria / Aquecimento", 0xFF29B6F6),
+    HOT_IDLE("Marcha Lenta Quente", 0xFF00E676),
+    PARTIAL_LOAD("Carga Parcial / Cruzeiro", 0xFFAB47BC),
+    WOT_FULL_LOAD("Plena Carga (WOT)", 0xFFFF7043)
+}
+
+/**
+ * Picos e estatísticas de mínimo e máximo registrados durante a sessão
+ */
+data class SessionSensorPeaks(
+    val minRpm: Float = Float.MAX_VALUE,
+    val maxRpm: Float = 0f,
+    val minMap: Float = Float.MAX_VALUE,
+    val maxMap: Float = 0f,
+    val minEct: Float = Float.MAX_VALUE,
+    val maxEct: Float = 0f,
+    val minVolt: Float = Float.MAX_VALUE,
+    val maxVolt: Float = 0f,
+    val minTps: Float = Float.MAX_VALUE,
+    val maxTps: Float = 0f,
+    val minLambda: Float = Float.MAX_VALUE,
+    val maxLambda: Float = 0f,
+    val maxVePercent: Float = 0f,
+    val sampleCount: Long = 0L
+) {
+    fun hasValidPeaks(): Boolean = sampleCount > 0L && maxRpm > 0f
+}
+
+/**
+ * Métrica de integridade e saúde da comunicação com a ECU na Linha K / CAN
+ */
+data class CommunicationBusHealth(
+    val totalRequests: Long = 0L,
+    val successfulFrames: Long = 0L,
+    val invalidOrTimeoutFrames: Long = 0L,
+    val healthPercent: Float = 100f,
+    val averageLatencyMs: Long = 0L,
+    val status: String = "Excelente (99%+)"
+)
+

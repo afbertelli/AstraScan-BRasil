@@ -1,15 +1,21 @@
 package com.example.serial
 
 import android.bluetooth.BluetoothDevice
+import com.example.model.CommunicationBusHealth
 import com.example.model.DtcCode
+import com.example.model.EcuSensorProfile
+import com.example.model.ElmChipBenchmark
+import com.example.model.HeartbeatStatus
 import com.example.model.LiveTelemetry
 import com.example.model.ProtocolType
-import com.example.model.EcuSensorProfile
 import com.example.model.ScanState
+import com.example.model.SessionSensorPeaks
+import com.example.model.TelemetrySamplingMode
 import com.example.model.VehicleProfile
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
@@ -18,7 +24,7 @@ import kotlinx.coroutines.launch
  *
  * Integra e coordena os dois módulos independentes e desacoplados:
  * - Módulo 1 (ObdConnectionEngine): Gerenciamento da conexão física, estabilidade serial,
- *   chip ELM327, cascata de protocolos e watchdog keep-alive em tempo real.
+ *   chip ELM327, cascata de protocolos e monitoramento Heartbeat contínuo a cada 2s.
  * - Módulo 2 (EcuIdentificationEngine): Identificação assertiva de ECU física,
  *   leitura de descritores GM (PN/CalID/VIN), mapeamento de sensores, telemetria contínua e DTCs.
  */
@@ -35,7 +41,8 @@ class AutoScannerManager(
         logCallback = { msg -> connectionEngine.logTerminal(msg) },
         onPhysicalConnectionChanged = { isPhysical ->
             connectionEngine.setPhysicalEcuConnected(isPhysical)
-        }
+        },
+        getActiveHeader = { connectionEngine.activeHeader }
     )
 
     // MÓDULO 3: Funções Especiais, Resets e Atuadores Seguros GM
@@ -43,9 +50,22 @@ class AutoScannerManager(
         scope = scope,
         commandSender = { cmd, timeoutMs -> connectionEngine.sendCommand(cmd, timeoutMs) },
         logCallback = { msg -> connectionEngine.logTerminal(msg) },
-        pauseTelemetry = { identificationEngine.pauseTelemetry() },
-        resumeTelemetry = { identificationEngine.resumeTelemetry() }
+        pauseTelemetry = {
+            identificationEngine.pauseTelemetry()
+            connectionEngine.pauseHeartbeat()
+        },
+        resumeTelemetry = {
+            identificationEngine.resumeTelemetry()
+            connectionEngine.resumeHeartbeat()
+        }
     )
+
+    init {
+        // Desconexão automática por falha de pulso Heartbeat aciona reset imediato da telemetria
+        connectionEngine.onHeartbeatFailed = {
+            identificationEngine.reset()
+        }
+    }
 
     // Delegação reativa de estados para compatibilidade direta com a UI e ViewModels
     val scanState: StateFlow<ScanState> = connectionEngine.scanState
@@ -56,6 +76,9 @@ class AutoScannerManager(
     val isPhysicalEcuConnected: StateFlow<Boolean> = connectionEngine.isPhysicalEcuConnected
     val isManualProfileConfigured: StateFlow<Boolean> = connectionEngine.isManualProfileConfigured
     val terminalLogs: StateFlow<List<String>> = connectionEngine.terminalLogs
+    val heartbeatStatus: StateFlow<HeartbeatStatus> = connectionEngine.heartbeatStatus
+    val elmBenchmark: StateFlow<ElmChipBenchmark> = connectionEngine.elmBenchmark
+    val batteryVoltage: StateFlow<Float> = connectionEngine.batteryVoltage
 
     val vehicleProfile: StateFlow<VehicleProfile> = identificationEngine.vehicleProfile
     val sensorProfile: StateFlow<EcuSensorProfile?> = identificationEngine.sensorProfile
@@ -63,6 +86,13 @@ class AutoScannerManager(
     val telemetry: StateFlow<LiveTelemetry> = identificationEngine.telemetry
     val activeDtcs: StateFlow<List<DtcCode>> = identificationEngine.activeDtcs
     val historyDtcs: StateFlow<List<DtcCode>> = identificationEngine.historyDtcs
+    val samplingMode: MutableStateFlow<TelemetrySamplingMode> = identificationEngine.samplingMode
+    val busHealth: StateFlow<CommunicationBusHealth> = identificationEngine.busHealth
+    val sessionPeaks: StateFlow<SessionSensorPeaks> = identificationEngine.sessionPeaks
+
+    fun resetSessionPeaks() {
+        identificationEngine.resetSessionPeaks()
+    }
 
     private var scanJob: Job? = null
 

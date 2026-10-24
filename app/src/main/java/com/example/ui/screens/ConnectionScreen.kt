@@ -109,6 +109,8 @@ fun ConnectionScreen(
     val isPhysicalEcuConnected by viewModel.isPhysicalEcuConnected.collectAsState()
     val isBluetoothConnected by viewModel.isBluetoothConnected.collectAsState()
     val isManualProfileConfigured by viewModel.isManualProfileConfigured.collectAsState()
+    val heartbeat by viewModel.heartbeatStatus.collectAsState()
+    val elmBenchmark by viewModel.elmBenchmark.collectAsState()
 
     var isAdapterExpanded by remember { mutableStateOf(false) }
     var isLogsExpanded by remember { mutableStateOf(false) }
@@ -527,7 +529,144 @@ fun ConnectionScreen(
                             lineHeight = 18.sp
                         )
 
-                        Spacer(modifier = Modifier.height(12.dp))
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        // =============================================================
+                        // MONITOR HEARTBEAT (Verificação de vida a cada 2s)
+                        // =============================================================
+                        if (isPhysicalEcuConnected) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Color(0xFF072412))
+                                    .border(1.dp, AstraGreen.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.weight(1f).padding(end = 8.dp)
+                                    ) {
+                                        Text(text = "❤️", fontSize = 14.sp)
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Column {
+                                            Text(
+                                                text = "HEARTBEAT ATIVO (PULSO 2s)",
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                color = AstraGreen
+                                            )
+                                            Text(
+                                                text = "Pulso de baixo custo: ${heartbeat.lastCommandSent.ifBlank { "Tester Present (3E)" }} • ${heartbeat.totalPulsesSent} pulsos",
+                                                fontSize = 10.sp,
+                                                color = TextSecondary,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    }
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(4.dp))
+                                            .background(AstraGreen.copy(alpha = 0.2f))
+                                            .padding(horizontal = 6.dp, vertical = 3.dp)
+                                    ) {
+                                        Text(
+                                            text = "${heartbeat.pulseLatencyMs}ms",
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            fontFamily = FontFamily.Monospace,
+                                            color = AstraGreen
+                                        )
+                                    }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            if (elmBenchmark.qualityTier != com.example.model.ElmQualityTier.UNKNOWN) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(Color(0xFF0D1B2A))
+                                        .border(1.dp, Color(elmBenchmark.qualityTier.badgeColorHex).copy(alpha = 0.5f), RoundedCornerShape(8.dp))
+                                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Text(text = "🔍", fontSize = 13.sp)
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Text(
+                                                    text = "CHIP ELM327: ${elmBenchmark.versionString}",
+                                                    fontSize = 11.sp,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = Color(elmBenchmark.qualityTier.badgeColorHex)
+                                                )
+                                            }
+                                            Text(
+                                                text = "${elmBenchmark.qualityTier.label} • ${elmBenchmark.recommendationText}",
+                                                fontSize = 10.sp,
+                                                color = TextSecondary,
+                                                lineHeight = 13.sp
+                                            )
+                                        }
+                                        Box(
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(4.dp))
+                                                .background(Color(elmBenchmark.qualityTier.badgeColorHex).copy(alpha = 0.2f))
+                                                .padding(horizontal = 6.dp, vertical = 3.dp)
+                                        ) {
+                                            Text(
+                                                text = "${elmBenchmark.latencyMs}ms",
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                fontFamily = FontFamily.Monospace,
+                                                color = Color(elmBenchmark.qualityTier.badgeColorHex)
+                                            )
+                                        }
+                                    }
+                                }
+                                Spacer(modifier = Modifier.height(10.dp))
+                            }
+                        } else if (scanState == ScanState.ERROR && statusMsg.contains("Heartbeat", ignoreCase = true)) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Color(0xFF330B0B))
+                                    .border(1.dp, AstraRedline.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+                                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(text = "💔", fontSize = 14.sp)
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column {
+                                        Text(
+                                            text = "DESCONEXÃO POR FALHA NO HEARTBEAT",
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = AstraRedline
+                                        )
+                                        Text(
+                                            text = "A central parou de responder ao pulso de vida de 2s. Desconexão automática de segurança realizada.",
+                                            fontSize = 10.sp,
+                                            color = TextSecondary
+                                        )
+                                    }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+                        }
 
                         if (isScanning) {
                             LinearProgressIndicator(

@@ -561,6 +561,271 @@ class ExampleUnitTest {
         val corruptedFrame = listOf(0x81, 0x11, 0xF1, 0x01, 0x00, 0x99)
         org.junit.Assert.assertFalse(GmDataParsers.validateKwpChecksum(corruptedFrame))
     }
+
+    @Test
+    fun testHeartbeatIntervalIs2Seconds() {
+        assertEquals(2000L, com.example.serial.ObdConnectionEngine.HEARTBEAT_INTERVAL_MS)
+    }
+
+    @Test
+    fun testHeartbeatResponsePositiveValidation() {
+        // Tester Present (3E) positive ack KWP2000 / UDS
+        assertTrue(com.example.serial.ObdConnectionEngine.validateHeartbeatResponse("7E"))
+        assertTrue(com.example.serial.ObdConnectionEngine.validateHeartbeatResponse("7E 00"))
+        assertTrue(com.example.serial.ObdConnectionEngine.validateHeartbeatResponse("81 F1 11 7E 01"))
+
+        // Standard OBD-II Mode 01 PID 00 Supported PIDs low-cost response
+        assertTrue(com.example.serial.ObdConnectionEngine.validateHeartbeatResponse("41 00 BE 3F B8 10"))
+        assertTrue(com.example.serial.ObdConnectionEngine.validateHeartbeatResponse("41 0C 0D 80"))
+
+        // ELM OK
+        assertTrue(com.example.serial.ObdConnectionEngine.validateHeartbeatResponse("OK"))
+    }
+
+    @Test
+    fun testHeartbeatResponseNegativeAndErrorRejection() {
+        // Sem resposta / timeouts / falhas de linha física
+        org.junit.Assert.assertFalse(com.example.serial.ObdConnectionEngine.validateHeartbeatResponse("NO DATA"))
+        org.junit.Assert.assertFalse(com.example.serial.ObdConnectionEngine.validateHeartbeatResponse("UNABLE TO CONNECT"))
+        org.junit.Assert.assertFalse(com.example.serial.ObdConnectionEngine.validateHeartbeatResponse("BUS INIT: ... ERROR"))
+        org.junit.Assert.assertFalse(com.example.serial.ObdConnectionEngine.validateHeartbeatResponse("CAN ERROR"))
+        org.junit.Assert.assertFalse(com.example.serial.ObdConnectionEngine.validateHeartbeatResponse("STOPPED"))
+        org.junit.Assert.assertFalse(com.example.serial.ObdConnectionEngine.validateHeartbeatResponse("FB ERROR"))
+        org.junit.Assert.assertFalse(com.example.serial.ObdConnectionEngine.validateHeartbeatResponse("?"))
+        org.junit.Assert.assertFalse(com.example.serial.ObdConnectionEngine.validateHeartbeatResponse(""))
+        org.junit.Assert.assertFalse(com.example.serial.ObdConnectionEngine.validateHeartbeatResponse("ERROR: Socket closed"))
+    }
+
+    @Test
+    fun testHeartbeatStatusModelDefaults() {
+        val status = com.example.model.HeartbeatStatus()
+        org.junit.Assert.assertFalse(status.isAlive)
+        assertEquals(0, status.totalPulsesSent)
+        assertEquals(0, status.consecutiveFailures)
+        assertEquals("Inativo", status.statusDescription)
+    }
+
+    @Test
+    fun testMode03DtcParserDirectSaFormat() {
+        // Padrão SAE J1979: 43h seguido diretamente de pares de bytes (P0133 e P0105)
+        val raw = listOf(0x43, 0x01, 0x33, 0x01, 0x05)
+        val parsed = GmDataParsers.parseDtcBytes(raw, expectedModeAck = 0x43, isPresent = true)
+        assertEquals(2, parsed.size)
+        assertEquals("P0133", parsed[0].code)
+        assertEquals("P0105", parsed[1].code)
+    }
+
+    @Test
+    fun testMode03DtcParserWithCountByte() {
+        // Formato com contador: 43h + numDtc (2) + pares de bytes
+        val raw = listOf(0x43, 0x02, 0x03, 0x00, 0x01, 0x15)
+        val parsed = GmDataParsers.parseDtcBytes(raw, expectedModeAck = 0x43, isPresent = true)
+        assertEquals(2, parsed.size)
+        assertEquals("P0300", parsed[0].code)
+        assertEquals("P0115", parsed[1].code)
+    }
+
+    @Test
+    fun testChartScaleRangeZeroDivisionProtection() {
+        val minScale = 1.0f
+        val maxScale = 1.0f
+        val scaleRange = (maxScale - minScale).takeIf { it > 0.0001f } ?: 1f
+        assertEquals(1f, scaleRange, 0.001f)
+        val rawNormalized = (1.0f - minScale) / scaleRange
+        val normalizedY = if (rawNormalized.isNaN() || rawNormalized.isInfinite()) 0f else rawNormalized.coerceIn(0f, 1f)
+        assertEquals(0f, normalizedY, 0.001f)
+    }
+
+    @Test
+    fun testFingerprinterPreservesCanHeader() = kotlinx.coroutines.runBlocking {
+        val executedCommands = mutableListOf<String>()
+        val fingerprinter = com.example.serial.EcuFingerprinter(
+            commandSender = { cmd, _ ->
+                executedCommands.add(cmd)
+                when (cmd) {
+                    "09 04" -> "49 04 01 4D 54 32 37 45"
+                    "09 02" -> "49 02 01 39 42 47 54 41 34 38 43 30 42 42 31 32 33 34 35 36"
+                    else -> "NO DATA"
+                }
+            },
+            logCallback = {},
+            getActiveHeader = { "7E0" }
+        )
+
+        val (profile, _) = fingerprinter.interrogateAndFingerprint()
+        // No CAN bus, a sonda de transmissão K-Line (AT SH 81 18 F1) deve ser ignorada
+        org.junit.Assert.assertFalse(executedCommands.any { it.contains("81 18 F1") })
+        // O cabeçalho CAN 7E0 não foi corrompido para 81 11 F1
+        org.junit.Assert.assertFalse(executedCommands.any { it.contains("AT SH 81 11 F1") })
+        assertEquals("Delphi Multec H / MT27E (Fase 2)", profile.ecuName)
+    }
+
+    @Test
+    fun testVinModelYear2009To2011Precision() {
+        val vin2009 = "9BGTA48C09B123456"
+        val vin2010 = "9BGTA48C0AB123456"
+        val vin2011 = "9BGTA48C0BB123456"
+        val vinPunctuation = "9BGTA48C0:B123456" // ASCII 58 (entre '9' e 'A')
+
+        val profile2009 = GmDataParsers.matchVehicleProfile(
+            partNumber = "94804161",
+            hardwareNumber = "",
+            softwareVersion = "",
+            calId = "MT27E_F2",
+            vin = vin2009,
+            ecuNameBroadcast = "",
+            hasIacConfirmed = false,
+            hasDbwConfirmed = true,
+            fallbackProfile = com.example.model.VehicleProfile.UNKNOWN
+        )
+        assertEquals("Delphi Multec H / MT27E (Fase 2)", profile2009.ecuName)
+
+        val profile2010 = GmDataParsers.matchVehicleProfile(
+            partNumber = "94804161",
+            hardwareNumber = "",
+            softwareVersion = "",
+            calId = "MT27E_F2",
+            vin = vin2010,
+            ecuNameBroadcast = "",
+            hasIacConfirmed = false,
+            hasDbwConfirmed = true,
+            fallbackProfile = com.example.model.VehicleProfile.UNKNOWN
+        )
+        assertEquals("Delphi Multec H / MT27E (Fase 2)", profile2010.ecuName)
+
+        val profile2011 = GmDataParsers.matchVehicleProfile(
+            partNumber = "94804161",
+            hardwareNumber = "",
+            softwareVersion = "",
+            calId = "MT27E_F2",
+            vin = vin2011,
+            ecuNameBroadcast = "",
+            hasIacConfirmed = false,
+            hasDbwConfirmed = true,
+            fallbackProfile = com.example.model.VehicleProfile.UNKNOWN
+        )
+        assertEquals("Delphi Multec H / MT27E (Fase 2)", profile2011.ecuName)
+
+        // Caractere de pontuação não deve ativar a Fase 2 (2009-2011)
+        val profilePunctuation = GmDataParsers.matchVehicleProfile(
+            partNumber = "",
+            hardwareNumber = "",
+            softwareVersion = "",
+            calId = "",
+            vin = vinPunctuation,
+            ecuNameBroadcast = "",
+            hasIacConfirmed = false,
+            hasDbwConfirmed = true,
+            fallbackProfile = com.example.model.VehicleProfile.UNKNOWN
+        )
+        assertEquals("Delphi Multec H / MT27E (Fase 1)", profilePunctuation.ecuName)
+    }
+
+    @Test
+    fun testElm327HardwareEvaluationOriginalPic() {
+        val bench = com.example.serial.ObdConnectionEngine.evaluateElmHardware(
+            ati = "ELM327 v1.5",
+            at1 = "OBDII to RS232 Interpreter (PIC18F25K80)",
+            latencyMs = 28L
+        )
+        assertEquals(com.example.model.ElmQualityTier.EXCELLENT_PIC18F, bench.qualityTier)
+        assertTrue(bench.isKLineCertified)
+        assertEquals(28L, bench.latencyMs)
+        assertTrue(bench.recommendationText.contains("PIC18F25K80"))
+    }
+
+    @Test
+    fun testElm327HardwareEvaluationCloneV21() {
+        val bench = com.example.serial.ObdConnectionEngine.evaluateElmHardware(
+            ati = "ELM327 v2.1",
+            at1 = "OBDII to RS232 Interpreter",
+            latencyMs = 85L
+        )
+        assertEquals(com.example.model.ElmQualityTier.QUESTIONABLE_CLONE, bench.qualityTier)
+        org.junit.Assert.assertFalse(bench.isKLineCertified)
+        assertTrue(bench.recommendationText.contains("Pino 7"))
+    }
+
+    @Test
+    fun testVolumetricEfficiencyCalculation() {
+        // Motor parado (0 RPM)
+        val veOff = GmDataParsers.calculateVolumetricEfficiency(rpm = 0f, mapKpa = 100f)
+        assertEquals(0f, veOff, 0.01f)
+
+        // Marcha lenta estabilizada 8V (850 RPM, vácuo alto, MAP ~32 kPa)
+        val veIdle8V = GmDataParsers.calculateVolumetricEfficiency(rpm = 850f, mapKpa = 32f, is16V = false)
+        assertTrue("VE de marcha lenta deve estar entre 18% e 32%, obtido: $veIdle8V", veIdle8V in 18f..32f)
+
+        // Plena carga 8V no pico de torque (3000 RPM, MAP ~98 kPa)
+        val veWot8V = GmDataParsers.calculateVolumetricEfficiency(rpm = 3000f, mapKpa = 98f, is16V = false)
+        assertTrue("VE em plena carga 8V deve estar entre 75% e 88%, obtido: $veWot8V", veWot8V in 75f..88f)
+
+        // Plena carga 16V no pico de rotação (4000 RPM, MAP ~98 kPa)
+        val veWot16V = GmDataParsers.calculateVolumetricEfficiency(rpm = 4000f, mapKpa = 98f, is16V = true)
+        assertTrue("VE em plena carga 16V deve estar entre 80% e 94%, obtido: $veWot16V", veWot16V in 80f..94f)
+    }
+
+    @Test
+    fun testEngineOperatingRegimeDetection() {
+        // Motor desligado
+        val telOff = com.example.model.LiveTelemetry(rpm = 0f, coolantTempC = 0f, throttlePercent = 0f)
+        assertEquals(com.example.model.EngineOperatingRegime.OFF, com.example.serial.AstraIdleHealthChecker.detectOperatingRegime(telOff))
+
+        // Fase fria
+        val telCold = com.example.model.LiveTelemetry(rpm = 1150f, coolantTempC = 45f, throttlePercent = 0f)
+        assertEquals(com.example.model.EngineOperatingRegime.COLD_START, com.example.serial.AstraIdleHealthChecker.detectOperatingRegime(telCold))
+
+        // Marcha lenta quente estabilizada
+        val telHotIdle = com.example.model.LiveTelemetry(rpm = 850f, coolantTempC = 90f, throttlePercent = 0f)
+        assertEquals(com.example.model.EngineOperatingRegime.HOT_IDLE, com.example.serial.AstraIdleHealthChecker.detectOperatingRegime(telHotIdle))
+
+        // Carga parcial (cruzeiro)
+        val telCruise = com.example.model.LiveTelemetry(rpm = 2400f, coolantTempC = 92f, throttlePercent = 22f, mapKpa = 48f)
+        assertEquals(com.example.model.EngineOperatingRegime.PARTIAL_LOAD, com.example.serial.AstraIdleHealthChecker.detectOperatingRegime(telCruise))
+
+        // Plena carga (WOT)
+        val telWot = com.example.model.LiveTelemetry(rpm = 4200f, coolantTempC = 92f, throttlePercent = 88f, mapKpa = 96f)
+        assertEquals(com.example.model.EngineOperatingRegime.WOT_FULL_LOAD, com.example.serial.AstraIdleHealthChecker.detectOperatingRegime(telWot))
+    }
+
+    @Test
+    fun testEvaluateDynamicRegimeSensorsNominalAdaptation() {
+        val profile = com.example.model.VehicleProfile.ASTRA_20_8V_FLEX_FASE2
+
+        // No regime frio, a faixa esperada de RPM se ajusta para 1.000 a 1.300
+        val telCold = com.example.model.LiveTelemetry(rpm = 1100f, coolantTempC = 40f, throttlePercent = 0f, mapKpa = 42f, injectionTimeMs = 3.8f)
+        val coldChecks = com.example.serial.AstraIdleHealthChecker.evaluateDynamicRegimeSensors(telCold, profile)
+        val rpmCheck = coldChecks.find { it.sensorId == "rpm" }
+        assertNotNull(rpmCheck)
+        assertTrue(rpmCheck!!.nominalRange.contains("1.000 - 1.300"))
+        assertTrue(rpmCheck.isOk)
+
+        // No regime WOT, a faixa de borboleta se ajusta para 70 - 100
+        val telWot = com.example.model.LiveTelemetry(rpm = 3800f, coolantTempC = 90f, throttlePercent = 85f, mapKpa = 96f)
+        val wotChecks = com.example.serial.AstraIdleHealthChecker.evaluateDynamicRegimeSensors(telWot, profile)
+        val tpsCheck = wotChecks.find { it.sensorId == "tps" }
+        assertNotNull(tpsCheck)
+        assertTrue(tpsCheck!!.nominalRange.contains("70 - 100"))
+        assertTrue(tpsCheck.isOk)
+    }
+
+    @Test
+    fun testSessionSensorPeaksTracking() {
+        val emptyPeaks = com.example.model.SessionSensorPeaks()
+        org.junit.Assert.assertFalse(emptyPeaks.hasValidPeaks())
+
+        val activePeaks = com.example.model.SessionSensorPeaks(
+            minRpm = 820f,
+            maxRpm = 6150f,
+            minMap = 28f,
+            maxMap = 98f,
+            maxVePercent = 84.5f,
+            sampleCount = 120L
+        )
+        assertTrue(activePeaks.hasValidPeaks())
+        assertEquals(6150f, activePeaks.maxRpm, 0.1f)
+        assertEquals(28f, activePeaks.minMap, 0.1f)
+    }
 }
 
 

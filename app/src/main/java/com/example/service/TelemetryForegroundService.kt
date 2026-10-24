@@ -38,9 +38,6 @@ class TelemetryForegroundService : Service() {
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    private var logFile: File? = null
-    private var fileWriter: FileWriter? = null
-
     private val _isRecording = MutableStateFlow(false)
     val isRecording: StateFlow<Boolean> = _isRecording.asStateFlow()
 
@@ -75,97 +72,39 @@ class TelemetryForegroundService : Service() {
         return START_STICKY
     }
 
-    fun startLoggingSession() {
-        if (_isRecording.value) return
-        try {
-            val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-            val logsDir = File(getExternalFilesDir(null), "datalogs")
-            if (!logsDir.exists()) logsDir.mkdirs()
+    fun startLoggingSession(fileName: String = "datalog.csv") {
+        _isRecording.value = true
+        _recordedCount.value = 0
+        updateNotification("Datalogger Gravando", "Arquivo: $fileName")
+    }
 
-            val file = File(logsDir, "AstraScan_Log_$timestamp.csv")
-            logFile = file
-            fileWriter = FileWriter(file, true).apply {
-                write("TimestampMs,DateTime,RPM,TargetIdleRPM,Speed_kmh,EngineLoad_pct,ECT_C,IAT_C,MAP_kPa,BARO_kPa,Vacuum_bar,MAF_gs,TPS_pct,TPS1_V,TPS2_V,Pedal_pct,TI_ms,DutyCycle_pct,IAC_steps,Spark_deg,KnockGlobal_deg,KnockCil1_deg,KnockCil2_deg,KnockCil3_deg,KnockCil4_deg,Lambda1_V,Lambda2_V,LambdaFactor,Loop_Status,STFT_pct,LTFT_pct,AF_Ratio,Ethanol_pct,Consump_Lh,Consump_kmL,EVAP_pct,ECU_Volt,ELM_Volt\n")
-                flush()
-            }
-            _recordedCount.value = 0
-            _isRecording.value = true
-            _lastExportedFilePath.value = file.absolutePath
-            updateNotification("Datalogger Gravando", "Arquivo: ${file.name}")
-        } catch (e: Exception) {
-            e.printStackTrace()
+    fun updateSampleCount(count: Int, rpm: Float) {
+        _recordedCount.value = count
+        if (count % 20 == 0) {
+            updateNotification("Datalogger Ativo", "$count amostras gravadas | RPM: ${rpm.toInt()}")
         }
     }
 
     fun logSample(telemetry: LiveTelemetry) {
-        if (!_isRecording.value || fileWriter == null) return
-        try {
-            val dateStr = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(Date(telemetry.timestampMs))
-            val line = String.format(
-                Locale.US,
-                "%d,%s,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.2f,%.2f,%.1f,%.2f,%.2f,%.1f,%.3f,%.1f,%d,%.1f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,\"%s\",%.1f,%.1f,%.2f,%.1f,%.2f,%.1f,%.1f,%.1f,%.1f\n",
-                telemetry.timestampMs,
-                dateStr,
-                telemetry.rpm,
-                telemetry.targetIdleRpm,
-                telemetry.speedKmh,
-                telemetry.engineLoadPercent,
-                telemetry.coolantTempC,
-                telemetry.intakeAirTempC,
-                telemetry.mapKpa,
-                telemetry.baroKpa,
-                telemetry.manifoldVacuumBar,
-                telemetry.estimatedMafGramsSec,
-                telemetry.throttlePercent,
-                telemetry.throttleVoltage1,
-                telemetry.throttleVoltage2,
-                telemetry.acceleratorPedalPercent,
-                telemetry.injectionTimeMs,
-                telemetry.injectorDutyCyclePercent,
-                telemetry.iacSteps,
-                telemetry.sparkAdvanceDeg,
-                telemetry.knockRetardDeg,
-                telemetry.knockCylinder1Deg,
-                telemetry.knockCylinder2Deg,
-                telemetry.knockCylinder3Deg,
-                telemetry.knockCylinder4Deg,
-                telemetry.lambdaVoltage,
-                telemetry.lambdaPostCatVoltage,
-                telemetry.equivalenceRatioLambda,
-                telemetry.fuelLoopStatus,
-                telemetry.shortTermFuelTrim,
-                telemetry.longTermFuelTrim,
-                telemetry.estimatedAfRatio,
-                telemetry.ethanolPercentage,
-                telemetry.instantConsumptionLitersHour,
-                telemetry.instantConsumptionKmPerLiter,
-                telemetry.evapPurgePercent,
-                telemetry.ecuBatteryVoltage,
-                telemetry.elmBatteryVoltage
-            )
-            fileWriter?.write(line)
-            fileWriter?.flush()
-            _recordedCount.value = _recordedCount.value + 1
-
-            if (_recordedCount.value % 20 == 0) {
-                updateNotification("Datalogger Ativo", "${_recordedCount.value} amostras gravadas | RPM: ${telemetry.rpm.toInt()}")
+        // Notificação de telemetria em segundo plano
+        if (_isRecording.value) {
+            val current = _recordedCount.value + 1
+            _recordedCount.value = current
+            if (current % 25 == 0) {
+                updateNotification("Datalogger Ativo", "$current amostras | RPM: ${telemetry.rpm.toInt()}")
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
         }
     }
 
     fun stopLoggingSession(): String? {
-        if (!_isRecording.value) return _lastExportedFilePath.value
-        try {
-            fileWriter?.flush()
-            fileWriter?.close()
-        } catch (_: Exception) {}
-        fileWriter = null
+        val wasRecording = _isRecording.value
         _isRecording.value = false
-        val path = logFile?.absolutePath
-        updateNotification("Datalogger Salvo", "Sessão concluída: ${_recordedCount.value} amostras.")
-        return path
+        if (wasRecording) {
+            updateNotification("Datalogger Salvo", "Sessão concluída: ${_recordedCount.value} amostras.")
+        } else {
+            updateNotification("AstraScan Conectado", "Telemetria e monitoramento de barramento ativos.")
+        }
+        return _lastExportedFilePath.value
     }
 
     private fun createNotificationChannel() {

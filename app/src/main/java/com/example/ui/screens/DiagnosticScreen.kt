@@ -22,6 +22,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import android.content.Intent
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.CheckCircle
@@ -32,6 +34,7 @@ import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.AlertDialog
@@ -206,6 +209,33 @@ fun DiagnosticScreen(
                                 Text("LIMPAR ECU", fontWeight = FontWeight.Bold)
                             }
                         }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    val context = LocalContext.current
+                    OutlinedButton(
+                        onClick = {
+                            val report = viewModel.generateTechnicalReport()
+                            val sendIntent = Intent().apply {
+                                action = Intent.ACTION_SEND
+                                putExtra(Intent.EXTRA_TEXT, report)
+                                type = "text/plain"
+                            }
+                            val shareIntent = Intent.createChooser(sendIntent, "Relatório Técnico GM Astra")
+                            context.startActivity(shareIntent)
+                        },
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = AstraCyan),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, AstraCyan.copy(alpha = 0.5f)),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(42.dp)
+                            .testTag("share_report_button")
+                    ) {
+                        Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("COMPARTILHAR CHECK-UP / RELATÓRIO DA OFICINA", fontSize = 11.sp, fontWeight = FontWeight.Bold)
                     }
                 }
             }

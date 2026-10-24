@@ -290,8 +290,11 @@ fun RealtimeTelemetryChart(
                     val linePath = Path()
                     val fillPath = Path()
 
+                    val scaleRange = (maxScale - minScale).takeIf { it > 0.0001f } ?: 1f
+
                     val mappedPoints = dataPoints.mapIndexed { index, value ->
-                        val normalizedY = ((value - minScale) / (maxScale - minScale)).coerceIn(0f, 1f)
+                        val rawNormalized = (value - minScale) / scaleRange
+                        val normalizedY = if (rawNormalized.isNaN() || rawNormalized.isInfinite()) 0f else rawNormalized.coerceIn(0f, 1f)
                         val x = index * stepX
                         val y = height - (normalizedY * height)
                         Offset(x, y)
@@ -363,9 +366,21 @@ fun RealtimeTelemetryChart(
                     }
                 }
 
+                val maxLabel = if (selectedChannel == ChartTelemetryChannel.LAMBDA) {
+                    String.format(Locale.US, "%.2f %s", maxScale, selectedChannel.unit)
+                } else {
+                    "${maxScale.toInt()} ${selectedChannel.unit}"
+                }
+
+                val minLabel = if (selectedChannel == ChartTelemetryChannel.LAMBDA) {
+                    String.format(Locale.US, "%.2f %s", minScale, selectedChannel.unit)
+                } else {
+                    "${minScale.toInt()} ${selectedChannel.unit}"
+                }
+
                 // Legendas de Escala Mínima e Máxima nos Cantos do Gráfico
                 Text(
-                    text = "${maxScale.toInt()} ${selectedChannel.unit}",
+                    text = maxLabel,
                     fontSize = 9.sp,
                     fontFamily = FontFamily.Monospace,
                     color = TextMuted,
@@ -375,7 +390,7 @@ fun RealtimeTelemetryChart(
                 )
 
                 Text(
-                    text = "${minScale.toInt()} ${selectedChannel.unit}",
+                    text = minLabel,
                     fontSize = 9.sp,
                     fontFamily = FontFamily.Monospace,
                     color = TextMuted,

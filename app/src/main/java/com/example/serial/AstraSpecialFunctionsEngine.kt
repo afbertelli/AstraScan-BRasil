@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Locale
 
 /**
  * Categorias de Funções Especiais e Atuadores do GM Astra
@@ -621,33 +622,61 @@ class AstraSpecialFunctionsEngine(
                     addLog("Iniciando rotina de compressão relativa...")
                     addLog("Passo 1: Bloqueando pulso de injeção para segurança mecânica...")
                     commandSender("30 08 07 00", 1500L)
-                    _executionState.value = SpecialExecutionState.Running(item.id, 0.3f, "Injeção cortada. Dê a partida no carro por 5 segundos...")
-                    delay(3000)
-                    addLog("Passo 2: Monitorando aceleração angular da roda fônica na partida...")
-                    val c1 = 100
-                    val c2 = (96..99).random()
-                    val c3 = (97..100).random()
-                    val c4 = (96..99).random()
-                    _executionState.value = SpecialExecutionState.Running(item.id, 0.8f, "Calculando equilíbrio de compressão...")
-                    delay(2000)
+                    _executionState.value = SpecialExecutionState.Running(item.id, 0.2f, "Injeção cortada. Dê a partida no carro por 4 segundos...")
+
+                    val crankRpmSamples = mutableListOf<Float>()
+                    for (step in 1..4) {
+                        delay(1000)
+                        val rpmRaw = try { commandSender("01 0C", 500L) } catch (_: Exception) { "" }
+                        val crankRpm = GmDataParsers.parseRpm(rpmRaw)
+                        if (crankRpm != null && crankRpm > 50f) {
+                            crankRpmSamples.add(crankRpm)
+                            addLog("Amostra $step de rotação no arranque: ${crankRpm.toInt()} RPM")
+                        }
+                        _executionState.value = SpecialExecutionState.Running(
+                            item.id,
+                            0.2f + (step * 0.15f),
+                            "Monitorando rotação da roda fônica na partida ($step/4s)..."
+                        )
+                    }
+
                     commandSender("30 00", 1000L) // Restaura injeção
-                    finishSuccess(
-                        item.id,
-                        "Compressão Relativa: Cilindro 1: $c1% | Cilindro 2: $c2% | Cilindro 3: $c3% | Cilindro 4: $c4%. Equilíbrio mecânico saudável (>95%)."
-                    )
+
+                    if (crankRpmSamples.isEmpty()) {
+                        finishSuccess(
+                            item.id,
+                            "Teste concluído: Injeção restabelecida. Não foi detectado acionamento do motor de partida durante o teste (0 RPM)."
+                        )
+                    } else {
+                        val avgRpm = crankRpmSamples.average().toFloat()
+                        val maxRpm = crankRpmSamples.maxOrNull() ?: avgRpm
+                        val minRpm = crankRpmSamples.minOrNull() ?: avgRpm
+                        val maxDev = maxRpm - minRpm
+                        val balancePercent = (100f - (maxDev / avgRpm * 100f)).coerceIn(80f, 100f)
+                        finishSuccess(
+                            item.id,
+                            "Compressão Relativa: Rotação média no arranque: ${avgRpm.toInt()} RPM. Variação máxima angular: ${maxDev.toInt()} RPM. Equilíbrio de compressão mecânica medido em ${String.format(Locale.US, "%.1f", balancePercent)}%."
+                        )
+                    }
                 }
 
                 "lambda_response_time" -> {
-                    addLog("Aferindo tempo de resposta da sonda de oxigênio em marcha lenta...")
+                    addLog("Aferindo tempo de resposta real da sonda de oxigênio em marcha lenta...")
                     val transitionTimes = mutableListOf<Long>()
                     var lastV = 0.45f
-                    val startMs = System.currentTimeMillis()
+                    var lastTransitionMs = System.currentTimeMillis()
 
                     for (i in 1..item.durationSeconds) {
-                        val raw = commandSender("01 14", 600L)
+                        val raw = try { commandSender("01 14", 600L) } catch (_: Exception) { "" }
                         val v = GmDataParsers.parseLambdaVoltage(raw) ?: 0.45f
+                        val now = System.currentTimeMillis()
                         if ((lastV < 0.45f && v >= 0.45f) || (lastV >= 0.45f && v < 0.45f)) {
-                            transitionTimes.add((180..260).random().toLong())
+                            val delta = now - lastTransitionMs
+                            if (delta in 50..1500) {
+                                transitionTimes.add(delta)
+                                addLog("Comutação detectada: ${v}V (Delta real: ${delta}ms)")
+                            }
+                            lastTransitionMs = now
                         }
                         lastV = v
                         _executionState.value = SpecialExecutionState.Running(
@@ -658,9 +687,13 @@ class AstraSpecialFunctionsEngine(
                         delay(1000)
                     }
 
-                    val avgTime = if (transitionTimes.isNotEmpty()) transitionTimes.average().toInt() else 215
-                    val statusStr = if (avgTime < 300) "Sonda rápida e ágil (${avgTime}ms - Excelente)" else "Sonda lenta/envelhecida (${avgTime}ms - Recomendada troca)"
-                    finishSuccess(item.id, "Resultado da Sonda 1: Tempo médio de comutação: ${avgTime}ms. $statusStr.")
+                    if (transitionTimes.isNotEmpty()) {
+                        val avgTime = transitionTimes.average().toInt()
+                        val statusStr = if (avgTime < 350) "Sonda rápida (${avgTime}ms - Excelente)" else "Sonda lenta (${avgTime}ms - Atenção)"
+                        finishSuccess(item.id, "Resultado Real Sonda 1: Tempo médio de comutação: ${avgTime}ms ($statusStr).")
+                    } else {
+                        finishSuccess(item.id, "Resultado Sonda 1: Tensão estável em ${String.format(Locale.US, "%.2f", lastV)}V. Sem cruzamento do limiar estequiométrico (0.45V) no intervalo de teste.")
+                    }
                 }
 
                 "calibrate_fuel_level_gauge" -> {
